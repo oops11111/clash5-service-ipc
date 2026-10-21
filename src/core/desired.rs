@@ -323,7 +323,7 @@ where
     }
 }
 
-async fn write_json_atomic<T>(path: &std::path::Path, value: &T) -> Result<()>
+pub(crate) async fn write_json_atomic<T>(path: &std::path::Path, value: &T) -> Result<()>
 where
     T: Serialize,
 {

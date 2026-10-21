@@ -6,6 +6,9 @@ use sha2::{Digest as _, Sha256};
 pub const OWNER_TOKEN_FILE_NAME: &str = ".clash-verge-service-owner-token";
 pub const SERVICE_PROTOCOL_HEADER: &str = "X-Clash-Verge-Service-Protocol";
 pub const SESSION_TOKEN_HEX_LEN: usize = 64;
+/// The WFP control component accepts a fixed-size PID list. Keep the IPC contract
+/// aligned so a malformed client request cannot be truncated by the privileged service.
+pub const PROCESS_PROXY_MAX_TARGETS: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion {
@@ -66,6 +69,12 @@ impl ProtocolInfo {
     pub const fn supports_runtime_file_read(&self) -> bool {
         self.protocol.epoch == ProtocolVersion::current().epoch
             && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_RUNTIME_FILE_READ
+    }
+
+    /// Whether the service exposes the authenticated Windows process-proxy session API.
+    pub const fn supports_process_proxy(&self) -> bool {
+        self.protocol.epoch == ProtocolVersion::current().epoch
+            && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_PROCESS_PROXY
     }
 }
 
@@ -160,6 +169,47 @@ pub struct StartClashResult {
     pub proxy_outcome: ProxyApplyOutcome,
 }
 
+/// One exact process instance selected for a Windows process-proxy session.
+///
+/// `created_at` is supplied by the process-tree tracker. The initial WFP component
+/// currently accepts only PIDs, so the service retains this value for the durable
+/// recovery record and rejects an attach when the tracker cannot provide it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessProxyTarget {
+    pub pid: u32,
+    pub created_at: u64,
+}
+
+/// A loopback relay and exact targets to be attached to the privileged WFP component.
+/// The chain credential remains inside the unprivileged relay and is never sent over
+/// the service IPC boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessProxyAttachRequest {
+    pub relay_pid: u32,
+    pub relay_port: u16,
+    pub targets: Vec<ProcessProxyTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessProxySession {
+    pub owner_key: String,
+    pub session_id: u64,
+    pub relay_pid: u32,
+    pub relay_port: u16,
+    pub targets: Vec<ProcessProxyTarget>,
+}
+
+/// Session status is deliberately fail-closed. A record that could not be cleaned up
+/// never appears as idle, because starting another redirect session could capture the
+/// wrong traffic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ProcessProxySessionStatus {
+    Idle,
+    Active { session: ProcessProxySession },
+    RecoveryRequired { detail: String },
+}
+
 /// Result of staging a bundle into the running core's generation.
 /// `RestartRequired` is a successful refusal that leaves stop-and-start as the fallback.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +276,9 @@ pub enum ServiceErrorCode {
     ProxyClearFailed = 1010,
     ProxyApplyFailed = 1011,
     AppDataRootNotOwned = 1012,
+    ProcessProxyUnavailable = 1013,
+    InvalidProcessProxySession = 1014,
+    ProcessProxyRecoveryRequired = 1015,
 }
 
 pub fn owner_key(identity: &OwnerIdentity) -> String {
@@ -346,8 +399,8 @@ impl<T> JsonConvert for T where T: Serialize + for<'de> Deserialize<'de> {}
 #[cfg(test)]
 mod tests {
     use super::{
-        MacosProxyConfig, OwnerIdentity, ProtocolInfo, ProtocolVersion, RuntimeBundle, ServiceErrorCode,
-        StartClashRequest, owner_key,
+        MacosProxyConfig, OwnerIdentity, ProcessProxyAttachRequest, ProcessProxySessionStatus, ProcessProxyTarget,
+        ProtocolInfo, ProtocolVersion, RuntimeBundle, ServiceErrorCode, StartClashRequest, owner_key,
     };
 
     #[test]
@@ -378,6 +431,9 @@ mod tests {
         assert_eq!(ServiceErrorCode::InvalidProxyConfig as u16, 1009);
         assert_eq!(ServiceErrorCode::ProxyClearFailed as u16, 1010);
         assert_eq!(ServiceErrorCode::ProxyApplyFailed as u16, 1011);
+        assert_eq!(ServiceErrorCode::ProcessProxyUnavailable as u16, 1013);
+        assert_eq!(ServiceErrorCode::InvalidProcessProxySession as u16, 1014);
+        assert_eq!(ServiceErrorCode::ProcessProxyRecoveryRequired as u16, 1015);
     }
 
     #[test]
@@ -402,6 +458,30 @@ mod tests {
         );
         assert!(!older.supports_client(ProtocolVersion::current(), crate::MIN_REQUIRED_SERVICE_REVISION));
         assert!(ProtocolInfo::current().supports_runtime_staging());
+    }
+
+    #[test]
+    fn process_proxy_requires_its_own_capability_revision() {
+        let mut older = ProtocolInfo::current();
+        older.protocol.revision = crate::MIN_SERVICE_REVISION_FOR_PROCESS_PROXY - 1;
+        assert!(!older.supports_process_proxy());
+        assert!(ProtocolInfo::current().supports_process_proxy());
+    }
+
+    #[test]
+    fn process_proxy_contract_round_trips_exact_targets() {
+        let request = ProcessProxyAttachRequest {
+            relay_pid: 77,
+            relay_port: 17_443,
+            targets: vec![ProcessProxyTarget {
+                pid: 78,
+                created_at: 1_734_000_000,
+            }],
+        };
+        let encoded = serde_json::to_vec(&request).expect("request should serialize");
+        let decoded: ProcessProxyAttachRequest = serde_json::from_slice(&encoded).expect("request should deserialize");
+        assert_eq!(decoded, request);
+        assert_eq!(ProcessProxySessionStatus::Idle, ProcessProxySessionStatus::Idle);
     }
 
     #[test]

@@ -69,6 +69,11 @@ impl ServicePaths {
         self.persistent_state_dir.join("active-owner.json")
     }
 
+    /// Durable marker for a WFP session which must be removed before another session starts.
+    pub fn process_proxy_session_path(&self) -> PathBuf {
+        self.persistent_state_dir.join("process-proxy-session.json")
+    }
+
     pub fn owner_generation_path(&self) -> PathBuf {
         self.persistent_state_dir.join("owner-generation.json")
     }
@@ -137,6 +142,7 @@ pub(crate) fn ensure_persistent_state_layout() -> anyhow::Result<()> {
     platform_security::ensure_private_service_directory(&users)?;
     platform_security::ensure_private_service_directory(&install)?;
     platform_security::secure_private_service_file_if_exists(&paths.active_owner_path())?;
+    platform_security::secure_private_service_file_if_exists(&paths.process_proxy_session_path())?;
     platform_security::secure_private_service_file_if_exists(&paths.owner_generation_path())?;
     Ok(())
 }

@@ -14,9 +14,9 @@ mod windows_identity;
 
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand,
-    MIN_REQUIRED_SERVICE_REVISION, MacosProxyConfig, OwnerCredentials, OwnerSessionProof, ProtocolInfo,
-    ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, RuntimeFileOutcome, RuntimeFileRequest, ServiceStatusSnapshot,
-    StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig,
+    MIN_REQUIRED_SERVICE_REVISION, MacosProxyConfig, OwnerCredentials, OwnerSessionProof, ProcessProxyAttachRequest,
+    ProcessProxySessionStatus, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, RuntimeFileOutcome,
+    RuntimeFileRequest, ServiceStatusSnapshot, StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig,
     core::structure::{JsonConvert, Response},
 };
 
@@ -275,6 +275,55 @@ pub async fn set_system_proxy(
         credentials,
         Some(session),
         body.clone(),
+        None,
+    )
+    .await
+}
+
+/// Attaches a Windows process-proxy session for the active owner session.
+pub async fn attach_process_proxy(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+    body: &ProcessProxyAttachRequest,
+) -> Result<Response<ProcessProxySessionStatus>> {
+    protected_call(
+        Verb::Post,
+        IpcCommand::ProcessProxySession,
+        credentials,
+        Some(session),
+        body.clone(),
+        Some(LIFECYCLE_TIMEOUT),
+    )
+    .await
+}
+
+/// Detaches the active Windows process-proxy session.
+pub async fn detach_process_proxy(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+) -> Result<Response<ProcessProxySessionStatus>> {
+    protected_call(
+        Verb::Delete,
+        IpcCommand::ProcessProxySession,
+        credentials,
+        Some(session),
+        (),
+        Some(LIFECYCLE_TIMEOUT),
+    )
+    .await
+}
+
+/// Returns the fail-closed process-proxy state for the active owner session.
+pub async fn get_process_proxy_status(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+) -> Result<Response<ProcessProxySessionStatus>> {
+    protected_call(
+        Verb::Get,
+        IpcCommand::ProcessProxySession,
+        credentials,
+        Some(session),
+        (),
         None,
     )
     .await
