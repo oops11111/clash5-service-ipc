@@ -4,7 +4,7 @@ use crate::core::paths::service_paths;
 use crate::{PROCESS_PROXY_MAX_TARGETS, ProcessProxyAttachRequest, ProcessProxySession, ProcessProxySessionStatus};
 use anyhow::{Context as _, Result};
 
-const DRIVER_PROTOCOL_VERSION: u32 = 1;
+const DRIVER_PROTOCOL_VERSION: u32 = 2;
 
 /// Attaches the current active core session to the WFP control component.
 ///
@@ -198,6 +198,14 @@ async fn driver_detach(_session_id: u64) -> std::result::Result<(), ServiceError
 
 #[cfg(windows)]
 #[repr(C)]
+#[derive(Clone, Copy)]
+struct DriverTarget {
+    pid: u64,
+    created_at: u64,
+}
+
+#[cfg(windows)]
+#[repr(C)]
 struct DriverAttachRequest {
     version: u32,
     size: u32,
@@ -205,7 +213,7 @@ struct DriverAttachRequest {
     relay_pid: u32,
     relay_port: u16,
     target_count: u16,
-    target_pids: [u64; PROCESS_PROXY_MAX_TARGETS],
+    targets: [DriverTarget; PROCESS_PROXY_MAX_TARGETS],
 }
 
 #[cfg(windows)]
@@ -230,10 +238,13 @@ fn driver_attach_blocking(session: &ProcessProxySession) -> std::result::Result<
         relay_pid: session.relay_pid,
         relay_port: session.relay_port,
         target_count: session.targets.len() as u16,
-        target_pids: [0; PROCESS_PROXY_MAX_TARGETS],
+        targets: [DriverTarget { pid: 0, created_at: 0 }; PROCESS_PROXY_MAX_TARGETS],
     };
     for (index, target) in session.targets.iter().enumerate() {
-        request.target_pids[index] = target.pid as u64;
+        request.targets[index] = DriverTarget {
+            pid: target.pid as u64,
+            created_at: target.created_at,
+        };
     }
     send_driver_ioctl(IOCTL_ATTACH_SESSION, &request)
 }
@@ -304,6 +315,15 @@ fn send_driver_ioctl<T>(code: u32, request: &T) -> std::result::Result<(), Servi
 mod tests {
     use super::validate_request;
     use crate::{ProcessProxyAttachRequest, ProcessProxyTarget};
+
+    #[cfg(windows)]
+    #[test]
+    fn driver_attach_layout_matches_kernel_protocol() {
+        use super::{DriverAttachRequest, DriverTarget};
+
+        assert_eq!(std::mem::size_of::<DriverTarget>(), 16);
+        assert_eq!(std::mem::size_of::<DriverAttachRequest>(), 2072);
+    }
 
     fn request() -> ProcessProxyAttachRequest {
         ProcessProxyAttachRequest {

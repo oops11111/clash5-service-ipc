@@ -171,9 +171,8 @@ pub struct StartClashResult {
 
 /// One exact process instance selected for a Windows process-proxy session.
 ///
-/// `created_at` is supplied by the process-tree tracker. The initial WFP component
-/// currently accepts only PIDs, so the service retains this value for the durable
-/// recovery record and rejects an attach when the tracker cannot provide it.
+/// `created_at` is the process creation FILETIME in 100-nanosecond intervals,
+/// supplied by the process-tree tracker and checked by the WFP component.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessProxyTarget {
     pub pid: u32,
