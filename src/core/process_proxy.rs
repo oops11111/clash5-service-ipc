@@ -170,7 +170,7 @@ pub async fn process_proxy_status(owner: &AuthenticatedOwner, active: &ActiveOwn
     match load_record().await {
         Ok(None) => ProcessProxySessionStatus::Idle,
         Ok(Some(record)) if record.session.owner_key == owner.key && record.session.session_id == active.generation => {
-            if record.phase == RecoveryPhase::Active && policy_is_active() {
+            if record.phase == RecoveryPhase::Active && policy_is_active().await {
                 ProcessProxySessionStatus::Active {
                     session: record.session,
                 }
@@ -270,12 +270,12 @@ async fn policy_remove() -> std::result::Result<(), ServiceError> {
 }
 
 #[cfg(windows)]
-fn policy_is_active() -> bool {
-    wfp::is_active()
+async fn policy_is_active() -> bool {
+    tokio::task::spawn_blocking(wfp::is_active).await.unwrap_or(false)
 }
 
 #[cfg(not(windows))]
-fn policy_is_active() -> bool {
+async fn policy_is_active() -> bool {
     true
 }
 
