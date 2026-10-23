@@ -12,6 +12,11 @@ use tokio::sync::RwLock;
 #[cfg(all(windows, any(not(feature = "test"), test)))]
 mod windows_identity;
 
+#[cfg(windows)]
+mod redirect_relay;
+#[cfg(windows)]
+pub use redirect_relay::TcpRedirectRelay;
+
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand,
     MIN_REQUIRED_SERVICE_REVISION, MacosProxyConfig, OwnerCredentials, OwnerSessionProof, ProcessProxyAttachRequest,

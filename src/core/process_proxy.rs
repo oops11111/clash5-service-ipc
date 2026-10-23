@@ -628,6 +628,123 @@ mod tests {
         cleanup.attached = false;
     }
 
+    #[cfg(all(windows, feature = "client"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires an elevated Windows host with the clash5 WFP driver loaded"]
+    async fn exact_target_tcp_round_trips_through_http_connect_relay() -> anyhow::Result<()> {
+        use super::{driver_attach_blocking, driver_detach_blocking, wfp};
+        use crate::TcpRedirectRelay;
+        use crate::core::process::process_identity;
+        use std::net::Ipv4Addr;
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        struct Cleanup {
+            child: Child,
+            session_id: u64,
+            attached: bool,
+            policy: bool,
+        }
+
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                if self.policy {
+                    let _ = wfp::remove();
+                }
+                if self.attached {
+                    let _ = driver_detach_blocking(self.session_id);
+                }
+            }
+        }
+
+        let session_id = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos(),
+        )?;
+        let token = "a".repeat(64);
+        let proxy = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let proxy_port = proxy.local_addr()?.port();
+        let relay = TcpRedirectRelay::bind(session_id, proxy_port, &token).await?;
+        let relay_port = relay.port()?;
+        let (stop_relay, relay_shutdown) = tokio::sync::oneshot::channel();
+        let relay_task = tokio::spawn(relay.run(relay_shutdown));
+        let proxy_task = tokio::spawn(async move {
+            let (mut socket, _) = proxy.accept().await?;
+            let mut headers = Vec::new();
+            loop {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).await?;
+                headers.push(byte[0]);
+                if headers.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+                if headers.len() > 4096 {
+                    anyhow::bail!("CONNECT request exceeded fixture limit");
+                }
+            }
+            socket.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
+            let mut payload = [0; 3];
+            socket.read_exact(&mut payload).await?;
+            socket.write_all(b"OK!").await?;
+            Ok::<_, anyhow::Error>((headers, payload))
+        });
+
+        let script = r#"Start-Sleep -Seconds 5; $client = New-Object System.Net.Sockets.TcpClient; try { $client.Connect('198.51.100.10', 443); $stream = $client.GetStream(); $sent = [Text.Encoding]::ASCII.GetBytes('C5!'); $stream.Write($sent, 0, $sent.Length); $received = New-Object byte[] 3; $count = $stream.Read($received, 0, 3); if ($count -ne 3 -or [Text.Encoding]::ASCII.GetString($received) -ne 'OK!') { exit 9 } } finally { $client.Dispose() }"#;
+        let child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let identity = process_identity(child.id())?.ok_or_else(|| anyhow::anyhow!("target exited before attach"))?;
+        let session = ProcessProxySession {
+            owner_key: "smoke".to_owned(),
+            session_id,
+            relay_pid: std::process::id(),
+            relay_port,
+            targets: vec![ProcessProxyTarget {
+                pid: child.id(),
+                created_at: identity.started_at,
+            }],
+        };
+        let mut cleanup = Cleanup {
+            child,
+            session_id,
+            attached: false,
+            policy: false,
+        };
+        driver_attach_blocking(&session)?;
+        cleanup.attached = true;
+        wfp::install()?;
+        cleanup.policy = true;
+
+        let (headers, payload) = tokio::time::timeout(Duration::from_secs(20), proxy_task).await???;
+        let headers = String::from_utf8(headers)?;
+        assert!(headers.starts_with("CONNECT 198.51.100.10:443 HTTP/1.1\r\n"));
+        assert!(headers.contains("Proxy-Authorization: Basic "));
+        assert_eq!(&payload, b"C5!");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let exit = loop {
+            if let Some(exit) = cleanup.child.try_wait()? {
+                break exit;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "target did not receive the relay response");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        anyhow::ensure!(exit.success(), "target did not receive the expected relay response");
+        let _ = stop_relay.send(());
+        tokio::time::timeout(Duration::from_secs(5), relay_task).await???;
+        wfp::remove()?;
+        cleanup.policy = false;
+        driver_detach_blocking(session_id)?;
+        cleanup.attached = false;
+        Ok(())
+    }
+
     #[cfg(windows)]
     #[test]
     fn driver_attach_layout_matches_kernel_protocol() {
