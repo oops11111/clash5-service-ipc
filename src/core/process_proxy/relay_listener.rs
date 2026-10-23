@@ -102,9 +102,11 @@ mod tests {
         assert!(!owned_loopback_listener(AF_INET6.into(), pid, port).unwrap());
         assert!(verify(pid, port).is_err());
 
-        let _ipv6 = TcpListener::bind((Ipv6Addr::LOCALHOST, port)).unwrap();
+        let ipv6 = TcpListener::bind((Ipv6Addr::LOCALHOST, port)).unwrap();
         assert!(verify(pid, port).is_ok());
         assert!(verify(pid.wrapping_add(1), port).is_err());
+        drop(ipv6);
+        assert!(verify(pid, port).is_err());
     }
 
     #[test]

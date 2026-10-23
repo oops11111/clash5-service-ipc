@@ -175,12 +175,21 @@ pub async fn process_proxy_status(owner: &AuthenticatedOwner, active: &ActiveOwn
         Ok(None) => ProcessProxySessionStatus::Idle,
         Ok(Some(record)) if record.session.owner_key == owner.key && record.session.session_id == active.generation => {
             match record.phase {
-                RecoveryPhase::Active if policy_is_active().await => ProcessProxySessionStatus::Active {
-                    session: record.session,
-                },
-                RecoveryPhase::Active => ProcessProxySessionStatus::RecoveryRequired {
-                    detail: "the WFP redirect filters are unavailable".to_owned(),
-                },
+                RecoveryPhase::Active => {
+                    if !policy_is_active().await {
+                        ProcessProxySessionStatus::RecoveryRequired {
+                            detail: "the WFP redirect filters are unavailable".to_owned(),
+                        }
+                    } else if !relay_listeners_present(&record.session) {
+                        ProcessProxySessionStatus::RecoveryRequired {
+                            detail: "the process-proxy relay listeners are unavailable".to_owned(),
+                        }
+                    } else {
+                        ProcessProxySessionStatus::Active {
+                            session: record.session,
+                        }
+                    }
+                }
                 RecoveryPhase::Pending => ProcessProxySessionStatus::RecoveryRequired {
                     detail: "a process-proxy attach was interrupted before activation".to_owned(),
                 },
@@ -193,6 +202,16 @@ pub async fn process_proxy_status(owner: &AuthenticatedOwner, active: &ActiveOwn
             detail: format!("the process-proxy recovery record cannot be read safely: {error:#}"),
         },
     }
+}
+
+#[cfg(windows)]
+fn relay_listeners_present(session: &ProcessProxySession) -> bool {
+    relay_listener::verify(session.relay_pid, session.relay_port).is_ok()
+}
+
+#[cfg(not(windows))]
+fn relay_listeners_present(_session: &ProcessProxySession) -> bool {
+    false
 }
 
 /// Runs before restoring normal service work. A surviving record is never assumed idle:
