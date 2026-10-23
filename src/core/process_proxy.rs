@@ -9,6 +9,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+#[cfg(windows)]
+mod wfp;
+
 const DRIVER_PROTOCOL_VERSION: u32 = 2;
 static RECOVERY_REQUIRED: AtomicBool = AtomicBool::new(false);
 
@@ -83,6 +86,9 @@ pub async fn attach_process_proxy(
     if let Err(error) = driver_attach(&session).await {
         return Err(rollback_failed_attach(session.session_id, error).await);
     }
+    if let Err(error) = policy_install().await {
+        return Err(rollback_failed_attach(session.session_id, error).await);
+    }
     if let Err(error) = persist_record(&RecoveryRecord {
         phase: RecoveryPhase::Active,
         session: session.clone(),
@@ -101,6 +107,12 @@ pub async fn attach_process_proxy(
 }
 
 async fn rollback_failed_attach(session_id: u64, error: ServiceError) -> ServiceError {
+    if let Err(rollback_error) = policy_remove().await {
+        RECOVERY_REQUIRED.store(true, Ordering::Release);
+        return ServiceError::process_proxy_recovery_required(format!(
+            "process-proxy attach failed: {error}; WFP policy rollback failed: {rollback_error}"
+        ));
+    }
     if let Err(rollback_error) = driver_detach(session_id).await {
         RECOVERY_REQUIRED.store(true, Ordering::Release);
         return ServiceError::process_proxy_recovery_required(format!(
@@ -131,6 +143,9 @@ pub async fn detach_process_proxy(
             "the recorded process-proxy session does not belong to the active owner session",
         ));
     }
+    policy_remove().await.inspect_err(|_| {
+        RECOVERY_REQUIRED.store(true, Ordering::Release);
+    })?;
     driver_detach(session.session_id).await.inspect_err(|_| {
         RECOVERY_REQUIRED.store(true, Ordering::Release);
     })?;
@@ -155,7 +170,7 @@ pub async fn process_proxy_status(owner: &AuthenticatedOwner, active: &ActiveOwn
     match load_record().await {
         Ok(None) => ProcessProxySessionStatus::Idle,
         Ok(Some(record)) if record.session.owner_key == owner.key && record.session.session_id == active.generation => {
-            if record.phase == RecoveryPhase::Active {
+            if record.phase == RecoveryPhase::Active && policy_is_active() {
                 ProcessProxySessionStatus::Active {
                     session: record.session,
                 }
@@ -181,6 +196,7 @@ pub async fn reconcile_process_proxy_session() -> Result<()> {
     let Some(record) = load_record().await? else {
         return Ok(());
     };
+    policy_remove().await.map_err(|error| anyhow::anyhow!(error.message))?;
     driver_detach(record.session.session_id)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))?;
@@ -225,6 +241,42 @@ fn recovery_read_error(error: anyhow::Error) -> ServiceError {
     ServiceError::process_proxy_recovery_required(format!(
         "the process-proxy recovery record cannot be read safely: {error:#}"
     ))
+}
+
+#[cfg(windows)]
+async fn policy_install() -> std::result::Result<(), ServiceError> {
+    tokio::task::spawn_blocking(wfp::install)
+        .await
+        .map_err(|error| ServiceError::process_proxy_unavailable(format!("WFP policy worker failed: {error}")))?
+}
+
+#[cfg(not(windows))]
+async fn policy_install() -> std::result::Result<(), ServiceError> {
+    Err(ServiceError::process_proxy_unavailable(
+        "WFP policy is only available on Windows",
+    ))
+}
+
+#[cfg(windows)]
+async fn policy_remove() -> std::result::Result<(), ServiceError> {
+    tokio::task::spawn_blocking(wfp::remove)
+        .await
+        .map_err(|error| ServiceError::process_proxy_unavailable(format!("WFP policy worker failed: {error}")))?
+}
+
+#[cfg(not(windows))]
+async fn policy_remove() -> std::result::Result<(), ServiceError> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn policy_is_active() -> bool {
+    wfp::is_active()
+}
+
+#[cfg(not(windows))]
+fn policy_is_active() -> bool {
+    true
 }
 
 async fn load_record() -> Result<Option<RecoveryRecord>> {
