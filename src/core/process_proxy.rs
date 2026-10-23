@@ -409,7 +409,10 @@ fn send_driver_ioctl<T>(code: u32, request: &T) -> std::result::Result<(), Servi
         System::IO::DeviceIoControl,
     };
 
-    let path = r"\\.\Clash5ProcessProxy\0".encode_utf16().collect::<Vec<_>>();
+    let path = r"\\.\Clash5ProcessProxy"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
     let handle = unsafe {
         CreateFileW(
             path.as_ptr(),
@@ -456,6 +459,99 @@ fn send_driver_ioctl<T>(code: u32, request: &T) -> std::result::Result<(), Servi
 mod tests {
     use super::{RecoveryPhase, RecoveryRecord, validate_request};
     use crate::{ProcessProxyAttachRequest, ProcessProxySession, ProcessProxyTarget};
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an elevated Windows host with the clash5 WFP driver loaded"]
+    fn exact_target_tcp_reaches_loopback_relay() {
+        use super::{driver_attach_blocking, driver_detach_blocking, wfp};
+        use crate::core::process::process_identity;
+        use std::io::{ErrorKind, Read};
+        use std::net::{Ipv4Addr, TcpListener};
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        struct Cleanup {
+            child: Child,
+            session_id: u64,
+            attached: bool,
+            policy: bool,
+        }
+
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                if self.policy {
+                    let _ = wfp::remove();
+                }
+                if self.attached {
+                    let _ = driver_detach_blocking(self.session_id);
+                }
+            }
+        }
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let relay_port = listener.local_addr().unwrap().port();
+        let script = r#"Start-Sleep -Seconds 5; $client = New-Object System.Net.Sockets.TcpClient; try { $client.Connect('198.51.100.10', 443); $bytes = [Text.Encoding]::ASCII.GetBytes('C5!'); $client.GetStream().Write($bytes, 0, $bytes.Length) } finally { $client.Dispose() }"#;
+        let child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let target = process_identity(child.id()).unwrap().unwrap();
+        let session_id = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap();
+        let session = ProcessProxySession {
+            owner_key: "smoke".to_owned(),
+            session_id,
+            relay_pid: std::process::id(),
+            relay_port,
+            targets: vec![ProcessProxyTarget {
+                pid: child.id(),
+                created_at: target.started_at,
+            }],
+        };
+        let mut cleanup = Cleanup {
+            child,
+            session_id,
+            attached: false,
+            policy: false,
+        };
+        driver_attach_blocking(&session).unwrap();
+        cleanup.attached = true;
+        wfp::install().unwrap();
+        cleanup.policy = true;
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => panic!("redirected target did not reach relay: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut payload = [0; 3];
+        stream.read_exact(&mut payload).unwrap();
+        assert_eq!(&payload, b"C5!");
+
+        wfp::remove().unwrap();
+        cleanup.policy = false;
+        driver_detach_blocking(session_id).unwrap();
+        cleanup.attached = false;
+    }
 
     #[cfg(windows)]
     #[test]
