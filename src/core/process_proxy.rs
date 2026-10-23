@@ -170,14 +170,16 @@ pub async fn process_proxy_status(owner: &AuthenticatedOwner, active: &ActiveOwn
     match load_record().await {
         Ok(None) => ProcessProxySessionStatus::Idle,
         Ok(Some(record)) if record.session.owner_key == owner.key && record.session.session_id == active.generation => {
-            if record.phase == RecoveryPhase::Active && policy_is_active().await {
-                ProcessProxySessionStatus::Active {
+            match record.phase {
+                RecoveryPhase::Active if policy_is_active().await => ProcessProxySessionStatus::Active {
                     session: record.session,
-                }
-            } else {
-                ProcessProxySessionStatus::RecoveryRequired {
+                },
+                RecoveryPhase::Active => ProcessProxySessionStatus::RecoveryRequired {
+                    detail: "the WFP redirect filters are unavailable".to_owned(),
+                },
+                RecoveryPhase::Pending => ProcessProxySessionStatus::RecoveryRequired {
                     detail: "a process-proxy attach was interrupted before activation".to_owned(),
-                }
+                },
             }
         }
         Ok(Some(_)) => ProcessProxySessionStatus::RecoveryRequired {
