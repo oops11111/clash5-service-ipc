@@ -3,19 +3,50 @@ use crate::core::desired::ActiveOwnerState;
 use crate::core::paths::service_paths;
 use crate::{PROCESS_PROXY_MAX_TARGETS, ProcessProxyAttachRequest, ProcessProxySession, ProcessProxySessionStatus};
 use anyhow::{Context as _, Result};
+use serde::{Deserialize, Serialize};
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 const DRIVER_PROTOCOL_VERSION: u32 = 2;
+static RECOVERY_REQUIRED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RecoveryPhase {
+    #[default]
+    Active,
+    Pending,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RecoveryRecord {
+    #[serde(default)]
+    phase: RecoveryPhase,
+    #[serde(flatten)]
+    session: ProcessProxySession,
+}
+
+fn operation_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 /// Attaches the current active core session to the WFP control component.
 ///
-/// Persistence happens after the driver accepts the request. If persistence fails, the
-/// driver session is immediately detached; a later attach remains blocked until any
-/// remaining record has been reconciled.
+/// A pending recovery record is durable before the driver can accept the session.
 pub async fn attach_process_proxy(
     owner: &AuthenticatedOwner,
     active: &ActiveOwnerState,
     request: &ProcessProxyAttachRequest,
 ) -> std::result::Result<ProcessProxySessionStatus, ServiceError> {
+    let _operation = operation_lock().lock().await;
+    if RECOVERY_REQUIRED.load(Ordering::Acquire) {
+        return Err(ServiceError::process_proxy_recovery_required(
+            "a previous process-proxy operation requires recovery",
+        ));
+    }
     validate_request(request)?;
     match load_record().await {
         Ok(Some(_)) => {
@@ -38,18 +69,51 @@ pub async fn attach_process_proxy(
         relay_port: request.relay_port,
         targets: request.targets.clone(),
     };
-    driver_attach(&session).await?;
-    if let Err(error) = persist_record(&session).await {
-        let rollback = driver_detach(session.session_id).await;
-        let detail = match rollback {
-            Ok(()) => format!("driver attach was rolled back after persistence failed: {error:#}"),
-            Err(rollback_error) => {
-                format!("driver attach succeeded but persistence failed: {error:#}; rollback failed: {rollback_error}")
-            }
-        };
-        return Err(ServiceError::process_proxy_recovery_required(detail));
+    persist_record(&RecoveryRecord {
+        phase: RecoveryPhase::Pending,
+        session: session.clone(),
+    })
+    .await
+    .map_err(|error| {
+        RECOVERY_REQUIRED.store(true, Ordering::Release);
+        ServiceError::process_proxy_recovery_required(format!(
+            "the process-proxy recovery intent could not be persisted: {error:#}"
+        ))
+    })?;
+    if let Err(error) = driver_attach(&session).await {
+        return Err(rollback_failed_attach(session.session_id, error).await);
+    }
+    if let Err(error) = persist_record(&RecoveryRecord {
+        phase: RecoveryPhase::Active,
+        session: session.clone(),
+    })
+    .await
+    {
+        return Err(rollback_failed_attach(
+            session.session_id,
+            ServiceError::process_proxy_recovery_required(format!(
+                "the accepted driver session could not be marked active: {error:#}"
+            )),
+        )
+        .await);
     }
     Ok(ProcessProxySessionStatus::Active { session })
+}
+
+async fn rollback_failed_attach(session_id: u64, error: ServiceError) -> ServiceError {
+    if let Err(rollback_error) = driver_detach(session_id).await {
+        RECOVERY_REQUIRED.store(true, Ordering::Release);
+        return ServiceError::process_proxy_recovery_required(format!(
+            "process-proxy attach failed: {error}; driver rollback failed: {rollback_error}"
+        ));
+    }
+    if let Err(clear_error) = clear_record().await {
+        RECOVERY_REQUIRED.store(true, Ordering::Release);
+        return ServiceError::process_proxy_recovery_required(format!(
+            "process-proxy attach failed: {error}; recovery record could not be cleared: {clear_error:#}"
+        ));
+    }
+    error
 }
 
 /// Detaches only the current authenticated owner's recorded session.
@@ -57,29 +121,49 @@ pub async fn detach_process_proxy(
     owner: &AuthenticatedOwner,
     active: &ActiveOwnerState,
 ) -> std::result::Result<ProcessProxySessionStatus, ServiceError> {
-    let Some(session) = load_record().await.map_err(recovery_read_error)? else {
+    let _operation = operation_lock().lock().await;
+    let Some(record) = load_record().await.map_err(recovery_read_error)? else {
         return Ok(ProcessProxySessionStatus::Idle);
     };
+    let session = record.session;
     if session.owner_key != owner.key || session.session_id != active.generation {
         return Err(ServiceError::process_proxy_recovery_required(
             "the recorded process-proxy session does not belong to the active owner session",
         ));
     }
-    driver_detach(session.session_id).await?;
+    driver_detach(session.session_id).await.inspect_err(|_| {
+        RECOVERY_REQUIRED.store(true, Ordering::Release);
+    })?;
     clear_record().await.map_err(|error| {
+        RECOVERY_REQUIRED.store(true, Ordering::Release);
         ServiceError::process_proxy_recovery_required(format!(
             "the driver session was detached but its recovery record could not be cleared: {error:#}"
         ))
     })?;
+    RECOVERY_REQUIRED.store(false, Ordering::Release);
     Ok(ProcessProxySessionStatus::Idle)
 }
 
 /// Returns a fail-closed status without exposing another owner's target list.
 pub async fn process_proxy_status(owner: &AuthenticatedOwner, active: &ActiveOwnerState) -> ProcessProxySessionStatus {
+    let _operation = operation_lock().lock().await;
+    if RECOVERY_REQUIRED.load(Ordering::Acquire) {
+        return ProcessProxySessionStatus::RecoveryRequired {
+            detail: "a previous process-proxy operation requires recovery".to_owned(),
+        };
+    }
     match load_record().await {
         Ok(None) => ProcessProxySessionStatus::Idle,
-        Ok(Some(session)) if session.owner_key == owner.key && session.session_id == active.generation => {
-            ProcessProxySessionStatus::Active { session }
+        Ok(Some(record)) if record.session.owner_key == owner.key && record.session.session_id == active.generation => {
+            if record.phase == RecoveryPhase::Active {
+                ProcessProxySessionStatus::Active {
+                    session: record.session,
+                }
+            } else {
+                ProcessProxySessionStatus::RecoveryRequired {
+                    detail: "a process-proxy attach was interrupted before activation".to_owned(),
+                }
+            }
         }
         Ok(Some(_)) => ProcessProxySessionStatus::RecoveryRequired {
             detail: "a process-proxy recovery record belongs to a different owner session".to_owned(),
@@ -93,13 +177,16 @@ pub async fn process_proxy_status(owner: &AuthenticatedOwner, active: &ActiveOwn
 /// Runs before restoring normal service work. A surviving record is never assumed idle:
 /// the service first asks the driver to detach it, then removes the record.
 pub async fn reconcile_process_proxy_session() -> Result<()> {
-    let Some(session) = load_record().await? else {
+    let _operation = operation_lock().lock().await;
+    let Some(record) = load_record().await? else {
         return Ok(());
     };
-    driver_detach(session.session_id)
+    driver_detach(record.session.session_id)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))?;
-    clear_record().await
+    clear_record().await?;
+    RECOVERY_REQUIRED.store(false, Ordering::Release);
+    Ok(())
 }
 
 fn validate_request(request: &ProcessProxyAttachRequest) -> std::result::Result<(), ServiceError> {
@@ -140,7 +227,7 @@ fn recovery_read_error(error: anyhow::Error) -> ServiceError {
     ))
 }
 
-async fn load_record() -> Result<Option<ProcessProxySession>> {
+async fn load_record() -> Result<Option<RecoveryRecord>> {
     let path = service_paths()?.process_proxy_session_path();
     crate::core::platform_security::secure_private_service_file_if_exists(&path)?;
     match tokio::fs::read(&path).await {
@@ -152,9 +239,9 @@ async fn load_record() -> Result<Option<ProcessProxySession>> {
     }
 }
 
-async fn persist_record(session: &ProcessProxySession) -> Result<()> {
+async fn persist_record(record: &RecoveryRecord) -> Result<()> {
     let path = service_paths()?.process_proxy_session_path();
-    crate::core::desired::write_json_atomic(&path, session).await
+    crate::core::desired::write_json_atomic(&path, record).await
 }
 
 async fn clear_record() -> Result<()> {
@@ -313,8 +400,8 @@ fn send_driver_ioctl<T>(code: u32, request: &T) -> std::result::Result<(), Servi
 
 #[cfg(test)]
 mod tests {
-    use super::validate_request;
-    use crate::{ProcessProxyAttachRequest, ProcessProxyTarget};
+    use super::{RecoveryPhase, RecoveryRecord, validate_request};
+    use crate::{ProcessProxyAttachRequest, ProcessProxySession, ProcessProxyTarget};
 
     #[cfg(windows)]
     #[test]
@@ -334,6 +421,28 @@ mod tests {
                 created_at: 123,
             }],
         }
+    }
+
+    #[test]
+    fn recovery_record_reads_legacy_active_session_and_preserves_pending_intent() {
+        let session = ProcessProxySession {
+            owner_key: "owner".to_owned(),
+            session_id: 7,
+            relay_pid: 10,
+            relay_port: 17_443,
+            targets: request().targets,
+        };
+        let legacy = serde_json::to_value(&session).unwrap();
+        let recovered: RecoveryRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(recovered.phase, RecoveryPhase::Active);
+        assert_eq!(recovered.session, session);
+
+        let pending = RecoveryRecord {
+            phase: RecoveryPhase::Pending,
+            session,
+        };
+        let recovered: RecoveryRecord = serde_json::from_value(serde_json::to_value(pending).unwrap()).unwrap();
+        assert_eq!(recovered.phase, RecoveryPhase::Pending);
     }
 
     #[test]
