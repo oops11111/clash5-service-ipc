@@ -468,8 +468,21 @@ mod tests {
         use crate::core::process::process_identity;
         use std::io::{ErrorKind, Read};
         use std::net::{Ipv4Addr, TcpListener};
+        use std::os::windows::io::AsRawSocket;
         use std::process::{Child, Command, Stdio};
         use std::time::{Duration, Instant};
+        use windows_sys::Win32::Networking::WinSock::{
+            AF_INET, SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT, SIO_QUERY_WFP_CONNECTION_REDIRECT_RECORDS,
+            SOCKADDR_STORAGE, WSAGetLastError, WSAIoctl,
+        };
+
+        #[repr(C)]
+        struct RedirectContext {
+            version: u32,
+            size: u32,
+            session_id: u64,
+            original_destination: SOCKADDR_STORAGE,
+        }
 
         struct Cleanup {
             child: Child,
@@ -543,6 +556,63 @@ mod tests {
         };
         stream.set_nonblocking(false).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let socket = usize::try_from(stream.as_raw_socket()).unwrap();
+        let mut context = RedirectContext {
+            version: 0,
+            size: 0,
+            session_id: 0,
+            original_destination: SOCKADDR_STORAGE::default(),
+        };
+        let mut context_bytes = 0;
+        let result = unsafe {
+            WSAIoctl(
+                socket,
+                SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT,
+                std::ptr::null(),
+                0,
+                (&mut context as *mut RedirectContext).cast(),
+                std::mem::size_of::<RedirectContext>() as u32,
+                &mut context_bytes,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+        assert_eq!(result, 0, "redirect context query failed: {}", unsafe {
+            WSAGetLastError()
+        });
+        assert_eq!(context_bytes as usize, std::mem::size_of::<RedirectContext>());
+        assert_eq!(context.version, 1);
+        assert_eq!(context.size as usize, std::mem::size_of::<RedirectContext>());
+        assert_eq!(context.session_id, session_id);
+        assert_eq!(context.original_destination.ss_family, AF_INET);
+        let destination = unsafe {
+            std::slice::from_raw_parts(
+                (&context.original_destination as *const SOCKADDR_STORAGE).cast::<u8>(),
+                std::mem::size_of::<SOCKADDR_STORAGE>(),
+            )
+        };
+        assert_eq!(&destination[2..4], &443u16.to_be_bytes());
+        assert_eq!(&destination[4..8], &[198, 51, 100, 10]);
+
+        let mut records = [0u8; 4096];
+        let mut record_bytes = 0;
+        let result = unsafe {
+            WSAIoctl(
+                socket,
+                SIO_QUERY_WFP_CONNECTION_REDIRECT_RECORDS,
+                std::ptr::null(),
+                0,
+                records.as_mut_ptr().cast(),
+                records.len() as u32,
+                &mut record_bytes,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+        assert_eq!(result, 0, "redirect records query failed: {}", unsafe {
+            WSAGetLastError()
+        });
+        assert!(record_bytes > 0);
         let mut payload = [0; 3];
         stream.read_exact(&mut payload).unwrap();
         assert_eq!(&payload, b"C5!");
