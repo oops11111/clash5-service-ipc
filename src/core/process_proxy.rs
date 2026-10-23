@@ -673,32 +673,36 @@ mod tests {
         let (stop_relay, relay_shutdown) = tokio::sync::oneshot::channel();
         let relay_task = tokio::spawn(relay.run(relay_shutdown));
         let proxy_task = tokio::spawn(async move {
-            let (mut socket, _) = proxy.accept().await?;
-            let mut headers = Vec::new();
-            loop {
-                let mut byte = [0];
-                socket.read_exact(&mut byte).await?;
-                headers.push(byte[0]);
-                if headers.ends_with(b"\r\n\r\n") {
-                    break;
+            let mut observed = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = proxy.accept().await?;
+                let mut headers = Vec::new();
+                loop {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).await?;
+                    headers.push(byte[0]);
+                    if headers.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                    if headers.len() > 4096 {
+                        anyhow::bail!("CONNECT request exceeded fixture limit");
+                    }
                 }
-                if headers.len() > 4096 {
-                    anyhow::bail!("CONNECT request exceeded fixture limit");
-                }
+                socket.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
+                let mut payload = [0; 3];
+                socket.read_exact(&mut payload).await?;
+                socket.write_all(b"OK!").await?;
+                observed.push((headers, payload));
             }
-            socket.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
-            let mut payload = [0; 3];
-            socket.read_exact(&mut payload).await?;
-            socket.write_all(b"OK!").await?;
-            Ok::<_, anyhow::Error>((headers, payload))
+            Ok::<_, anyhow::Error>(observed)
         });
 
-        let script = r#"Start-Sleep -Seconds 5; $client = New-Object System.Net.Sockets.TcpClient; try { $client.Connect('198.51.100.10', 443); $stream = $client.GetStream(); $sent = [Text.Encoding]::ASCII.GetBytes('C5!'); $stream.Write($sent, 0, $sent.Length); $received = New-Object byte[] 3; $count = $stream.Read($received, 0, 3); if ($count -ne 3 -or [Text.Encoding]::ASCII.GetString($received) -ne 'OK!') { exit 9 } } finally { $client.Dispose() }"#;
+        let script = r#"Start-Sleep -Seconds 5; foreach ($target in @('198.51.100.10', '2001:db8::10')) { $family = if ($target.Contains(':')) { [System.Net.Sockets.AddressFamily]::InterNetworkV6 } else { [System.Net.Sockets.AddressFamily]::InterNetwork }; $client = [System.Net.Sockets.TcpClient]::new($family); try { $client.Connect($target, 443); $stream = $client.GetStream(); $sent = [Text.Encoding]::ASCII.GetBytes('C5!'); $stream.Write($sent, 0, $sent.Length); $received = New-Object byte[] 3; $count = $stream.Read($received, 0, 3); if ($count -ne 3 -or [Text.Encoding]::ASCII.GetString($received) -ne 'OK!') { exit 9 } } finally { $client.Dispose() } }"#;
         let child = Command::new("powershell.exe")
             .args(["-NoProfile", "-Command", script])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()?;
         let identity = process_identity(child.id())?.ok_or_else(|| anyhow::anyhow!("target exited before attach"))?;
         let session = ProcessProxySession {
@@ -722,11 +726,13 @@ mod tests {
         wfp::install()?;
         cleanup.policy = true;
 
-        let (headers, payload) = tokio::time::timeout(Duration::from_secs(20), proxy_task).await???;
-        let headers = String::from_utf8(headers)?;
-        assert!(headers.starts_with("CONNECT 198.51.100.10:443 HTTP/1.1\r\n"));
-        assert!(headers.contains("Proxy-Authorization: Basic "));
-        assert_eq!(&payload, b"C5!");
+        let observed = tokio::time::timeout(Duration::from_secs(20), proxy_task).await???;
+        for ((headers, payload), target) in observed.into_iter().zip(["198.51.100.10:443", "[2001:db8::10]:443"]) {
+            let headers = String::from_utf8(headers)?;
+            assert!(headers.starts_with(&format!("CONNECT {target} HTTP/1.1\r\n")));
+            assert!(headers.contains("Proxy-Authorization: Basic "));
+            assert_eq!(&payload, b"C5!");
+        }
         let deadline = Instant::now() + Duration::from_secs(10);
         let exit = loop {
             if let Some(exit) = cleanup.child.try_wait()? {
