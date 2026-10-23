@@ -43,6 +43,10 @@ pub use core::{CoreWatchdogTestConfig, set_core_watchdog_config_for_tests};
 
 #[cfg(feature = "client")]
 pub use client::*;
+#[cfg(feature = "client")]
+pub use client::{
+    attach_process_proxy as request_process_proxy_attach, detach_process_proxy as request_process_proxy_detach,
+};
 
 #[cfg(all(target_os = "macos", not(feature = "test"), not(feature = "development-channel")))]
 pub static IPC_PATH: &str = "/var/run/clash-verge-service/service.sock";

@@ -10,6 +10,8 @@ use std::sync::{
 };
 
 #[cfg(windows)]
+mod relay_listener;
+#[cfg(windows)]
 mod wfp;
 
 const DRIVER_PROTOCOL_VERSION: u32 = 2;
@@ -64,6 +66,8 @@ pub async fn attach_process_proxy(
             )));
         }
     }
+    #[cfg(windows)]
+    relay_listener::verify(request.relay_pid, request.relay_port)?;
 
     let session = ProcessProxySession {
         owner_key: owner.key.clone(),
@@ -467,7 +471,7 @@ mod tests {
         use super::{driver_attach_blocking, driver_detach_blocking, wfp};
         use crate::core::process::process_identity;
         use std::io::{ErrorKind, Read};
-        use std::net::{Ipv4Addr, TcpListener};
+        use std::net::{Ipv4Addr, Ipv6Addr, TcpListener};
         use std::os::windows::io::AsRawSocket;
         use std::process::{Child, Command, Stdio};
         use std::time::{Duration, Instant};
@@ -507,6 +511,7 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let relay_port = listener.local_addr().unwrap().port();
+        let _ipv6_listener = TcpListener::bind((Ipv6Addr::LOCALHOST, relay_port)).unwrap();
         let script = r#"Start-Sleep -Seconds 5; $client = New-Object System.Net.Sockets.TcpClient; try { $client.Connect('198.51.100.10', 443); $bytes = [Text.Encoding]::ASCII.GetBytes('C5!'); $client.GetStream().Write($bytes, 0, $bytes.Length) } finally { $client.Dispose() }"#;
         let child = Command::new("powershell.exe")
             .args(["-NoProfile", "-Command", script])
