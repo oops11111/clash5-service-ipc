@@ -5,7 +5,7 @@ use windows_sys::{
         Foundation::HANDLE,
         NetworkManagement::WindowsFilteringPlatform::{
             FWP_ACTION_CALLOUT_TERMINATING, FWP_MATCH_EQUAL, FWP_UINT8, FWPM_CALLOUT0, FWPM_CONDITION_IP_PROTOCOL,
-            FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_PERMIT_IF_CALLOUT_UNREGISTERED, FWPM_FILTER0,
+            FWPM_DISPLAY_DATA0, FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_PERMIT_IF_CALLOUT_UNREGISTERED, FWPM_FILTER0,
             FWPM_LAYER_ALE_CONNECT_REDIRECT_V4, FWPM_LAYER_ALE_CONNECT_REDIRECT_V6, FWPM_PROVIDER0,
             FWPM_SESSION_FLAG_DYNAMIC, FWPM_SESSION0, FWPM_SUBLAYER0, FwpmCalloutAdd0, FwpmEngineClose0,
             FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterGetById0, FwpmFreeMemory0, FwpmProviderAdd0, FwpmSubLayerAdd0,
@@ -141,8 +141,10 @@ fn filter_is_active(engine: HANDLE, id: u64, layer: GUID, callout: GUID) -> bool
 }
 
 fn add_policy(engine: HANDLE) -> Result<[u64; 2], ServiceError> {
+    let mut provider_name = wide("clash5 process proxy provider");
     let provider = FWPM_PROVIDER0 {
         providerKey: PROVIDER,
+        displayData: display(&mut provider_name),
         ..Default::default()
     };
     check(
@@ -150,8 +152,10 @@ fn add_policy(engine: HANDLE) -> Result<[u64; 2], ServiceError> {
         "add WFP provider",
     )?;
     let mut provider_key = PROVIDER;
+    let mut sublayer_name = wide("clash5 process proxy sublayer");
     let sublayer = FWPM_SUBLAYER0 {
         subLayerKey: SUBLAYER,
+        displayData: display(&mut sublayer_name),
         providerKey: &mut provider_key,
         weight: 0x100,
         ..Default::default()
@@ -169,8 +173,11 @@ fn add_policy(engine: HANDLE) -> Result<[u64; 2], ServiceError> {
     .into_iter()
     .enumerate()
     {
+        let family = if index == 0 { "IPv4" } else { "IPv6" };
+        let mut callout_name = wide(&format!("clash5 {family} process proxy callout"));
         let callout = FWPM_CALLOUT0 {
             calloutKey: callout_key,
+            displayData: display(&mut callout_name),
             providerKey: &mut provider_key,
             applicableLayer: layer,
             ..Default::default()
@@ -187,7 +194,9 @@ fn add_policy(engine: HANDLE) -> Result<[u64; 2], ServiceError> {
         };
         tcp.conditionValue.r#type = FWP_UINT8;
         tcp.conditionValue.Anonymous.uint8 = 6;
+        let mut filter_name = wide(&format!("clash5 {family} TCP process proxy filter"));
         let mut filter = FWPM_FILTER0 {
+            displayData: display(&mut filter_name),
             providerKey: &mut provider_key,
             layerKey: layer,
             subLayerKey: SUBLAYER,
@@ -206,6 +215,17 @@ fn add_policy(engine: HANDLE) -> Result<[u64; 2], ServiceError> {
     Ok(filters)
 }
 
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn display(name: &mut [u16]) -> FWPM_DISPLAY_DATA0 {
+    FWPM_DISPLAY_DATA0 {
+        name: name.as_mut_ptr(),
+        description: std::ptr::null_mut(),
+    }
+}
+
 fn check(code: u32, action: &str) -> Result<(), ServiceError> {
     if code == 0 {
         Ok(())
@@ -220,4 +240,75 @@ fn guid_eq(left: GUID, right: GUID) -> bool {
 
 fn unavailable(message: impl Into<String>) -> ServiceError {
     ServiceError::process_proxy_unavailable(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an elevated Windows test host"]
+    fn dynamic_filters_install_read_back_and_remove() {
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = remove();
+            }
+        }
+
+        install().expect("WFP policy installation should succeed");
+        let _cleanup = Cleanup;
+        let filters = active_engine()
+            .lock()
+            .unwrap()
+            .expect("active WFP session should exist")
+            .filters
+            .expect("installed filter IDs should be retained");
+        let mut observer: HANDLE = std::ptr::null_mut();
+        check(
+            unsafe {
+                FwpmEngineOpen0(
+                    std::ptr::null(),
+                    RPC_C_AUTHN_WINNT,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &mut observer,
+                )
+            },
+            "open independent WFP observer",
+        )
+        .unwrap();
+        struct Observer(HANDLE);
+        impl Drop for Observer {
+            fn drop(&mut self) {
+                unsafe { FwpmEngineClose0(self.0) };
+            }
+        }
+        let observer = Observer(observer);
+        assert!(filter_is_active(
+            observer.0,
+            filters[0],
+            FWPM_LAYER_ALE_CONNECT_REDIRECT_V4,
+            CALLOUT_V4
+        ));
+        assert!(filter_is_active(
+            observer.0,
+            filters[1],
+            FWPM_LAYER_ALE_CONNECT_REDIRECT_V6,
+            CALLOUT_V6
+        ));
+        remove().expect("WFP policy removal should succeed");
+        assert!(!filter_is_active(
+            observer.0,
+            filters[0],
+            FWPM_LAYER_ALE_CONNECT_REDIRECT_V4,
+            CALLOUT_V4
+        ));
+        assert!(!filter_is_active(
+            observer.0,
+            filters[1],
+            FWPM_LAYER_ALE_CONNECT_REDIRECT_V6,
+            CALLOUT_V6
+        ));
+    }
 }
