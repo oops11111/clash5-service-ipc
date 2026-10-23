@@ -647,14 +647,17 @@ mod tests {
         cleanup.attached = false;
     }
 
-    #[cfg(all(windows, feature = "client"))]
+    #[cfg(all(windows, feature = "client", feature = "test"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires an elevated Windows host with the clash5 WFP driver loaded"]
     async fn exact_target_tcp_round_trips_through_http_connect_relay() -> anyhow::Result<()> {
         use super::{driver_attach_blocking, driver_detach_blocking, wfp};
         use crate::TcpRedirectRelay;
+        use crate::core::manager::CORE_MANAGER;
+        use crate::core::paths::{ensure_persistent_state_layout, service_paths};
         use crate::core::process::process_identity;
         use std::net::Ipv4Addr;
+        use std::path::PathBuf;
         use std::process::{Child, Command, Stdio};
         use std::time::{Duration, Instant};
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -664,6 +667,7 @@ mod tests {
             session_id: u64,
             attached: bool,
             policy: bool,
+            record_path: Option<PathBuf>,
         }
 
         impl Drop for Cleanup {
@@ -675,6 +679,9 @@ mod tests {
                 }
                 if self.attached {
                     let _ = driver_detach_blocking(self.session_id);
+                }
+                if let Some(path) = &self.record_path {
+                    let _ = std::fs::remove_file(path);
                 }
             }
         }
@@ -739,11 +746,19 @@ mod tests {
             session_id,
             attached: false,
             policy: false,
+            record_path: None,
         };
         driver_attach_blocking(&session)?;
         cleanup.attached = true;
         wfp::install()?;
         cleanup.policy = true;
+        ensure_persistent_state_layout()?;
+        cleanup.record_path = Some(service_paths()?.process_proxy_session_path());
+        super::persist_record(&RecoveryRecord {
+            phase: RecoveryPhase::Active,
+            session: session.clone(),
+        })
+        .await?;
 
         let observed = tokio::time::timeout(Duration::from_secs(20), proxy_task).await???;
         for ((headers, payload), target) in observed.into_iter().zip(["198.51.100.10:443", "[2001:db8::10]:443"]) {
@@ -761,12 +776,17 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         anyhow::ensure!(exit.success(), "target did not receive the expected relay response");
+        CORE_MANAGER.lock().await.stop_core().await?;
+        anyhow::ensure!(!wfp::is_active(), "core stop left WFP filters active");
+        anyhow::ensure!(
+            super::load_record().await?.is_none(),
+            "core stop left the recovery record"
+        );
+        cleanup.attached = false;
+        cleanup.policy = false;
+        cleanup.record_path = None;
         let _ = stop_relay.send(());
         tokio::time::timeout(Duration::from_secs(5), relay_task).await???;
-        wfp::remove()?;
-        cleanup.policy = false;
-        driver_detach_blocking(session_id)?;
-        cleanup.attached = false;
         Ok(())
     }
 
