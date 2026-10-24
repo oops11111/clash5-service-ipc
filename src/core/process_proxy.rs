@@ -8,6 +8,8 @@ use std::sync::{
     OnceLock,
     atomic::{AtomicBool, Ordering},
 };
+#[cfg(windows)]
+use std::time::Duration;
 
 #[cfg(windows)]
 mod relay_listener;
@@ -107,6 +109,8 @@ pub async fn attach_process_proxy(
         )
         .await);
     }
+    #[cfg(windows)]
+    tokio::spawn(monitor_session(session.owner_key.clone(), session.session_id));
     Ok(ProcessProxySessionStatus::Active { session })
 }
 
@@ -245,6 +249,41 @@ async fn active_target_present(session: &ProcessProxySession) -> Result<bool> {
 #[cfg(not(windows))]
 async fn active_target_present(_session: &ProcessProxySession) -> Result<bool> {
     Ok(true)
+}
+
+#[cfg(windows)]
+async fn monitor_session(owner_key: String, session_id: u64) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        let _operation = operation_lock().lock().await;
+        let record = match load_record().await {
+            Ok(Some(record)) => record,
+            Ok(None) => return,
+            Err(error) => {
+                RECOVERY_REQUIRED.store(true, Ordering::Release);
+                tracing::error!("process-proxy monitor cannot read its recovery record: {error:#}");
+                return;
+            }
+        };
+        if record.session.owner_key != owner_key || record.session.session_id != session_id {
+            return;
+        }
+        if record.phase != RecoveryPhase::Active {
+            RECOVERY_REQUIRED.store(true, Ordering::Release);
+            tracing::error!("process-proxy monitor found a non-active recovery record");
+            return;
+        }
+        let targets_live = active_target_present(&record.session).await;
+        if matches!(targets_live, Ok(true)) && policy_is_active().await && relay_listeners_present(&record.session) {
+            continue;
+        }
+        if let Err(error) = clear_recorded_session(session_id).await {
+            RECOVERY_REQUIRED.store(true, Ordering::Release);
+            tracing::error!("process-proxy monitor could not detach its session: {error:#}");
+        }
+        return;
+    }
 }
 
 /// Runs before restoring normal service work. A surviving record is never assumed idle:
@@ -864,7 +903,7 @@ mod tests {
         let _ = cleanup.child.kill();
         let _ = cleanup.child.wait();
         cleanup.child = Command::new("powershell.exe")
-            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 3"])
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 20"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -872,29 +911,6 @@ mod tests {
         cleanup.session_id = session_id + 2;
         let exit_identity =
             process_identity(cleanup.child.id())?.ok_or_else(|| anyhow::anyhow!("exit target ended before attach"))?;
-        let exit_session = ProcessProxySession {
-            session_id: cleanup.session_id,
-            targets: vec![ProcessProxyTarget {
-                pid: cleanup.child.id(),
-                created_at: exit_identity.started_at,
-            }],
-            ..session.clone()
-        };
-        driver_attach_blocking(&exit_session)?;
-        cleanup.attached = true;
-        wfp::install()?;
-        cleanup.policy = true;
-        cleanup.record_path = Some(service_paths()?.process_proxy_session_path());
-        super::persist_record(&RecoveryRecord {
-            phase: RecoveryPhase::Active,
-            session: exit_session,
-        })
-        .await?;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while cleanup.child.try_wait()?.is_none() {
-            anyhow::ensure!(Instant::now() < deadline, "exit target did not finish");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
         let owner = crate::core::auth::AuthenticatedOwner {
             key: "smoke".to_owned(),
             identity: crate::OwnerIdentity::Windows {
@@ -904,12 +920,37 @@ mod tests {
         };
         let mut active = crate::core::desired::ActiveOwnerState::from(&owner);
         active.generation = cleanup.session_id;
+        let request = ProcessProxyAttachRequest {
+            relay_pid: std::process::id(),
+            relay_port,
+            targets: vec![ProcessProxyTarget {
+                pid: cleanup.child.id(),
+                created_at: exit_identity.started_at,
+            }],
+        };
+        cleanup.record_path = Some(service_paths()?.process_proxy_session_path());
+        cleanup.attached = true;
+        cleanup.policy = true;
+        anyhow::ensure!(
+            matches!(
+                super::attach_process_proxy(&owner, &active, &request).await?,
+                ProcessProxySessionStatus::Active { .. }
+            ),
+            "service attach did not activate the exit target"
+        );
+        let _ = cleanup.child.kill();
+        cleanup.child.wait()?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while super::load_record().await?.is_some() {
+            anyhow::ensure!(Instant::now() < deadline, "monitor did not detach exited target");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         anyhow::ensure!(
             matches!(
                 super::process_proxy_status(&owner, &active).await,
                 ProcessProxySessionStatus::Idle
             ),
-            "status did not detach an exited target session"
+            "status did not report an idle session after target exit"
         );
         anyhow::ensure!(!wfp::is_active(), "target exit left WFP filters active");
         anyhow::ensure!(
