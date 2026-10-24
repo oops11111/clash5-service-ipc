@@ -965,6 +965,117 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(all(windows, feature = "client", feature = "test"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires an elevated Windows host, the WFP driver, and an external Mihomo Chain fixture"]
+    async fn exact_target_tcp_traverses_external_mihomo_chain() -> anyhow::Result<()> {
+        use super::{driver_detach_blocking, wfp};
+        use crate::TcpRedirectRelay;
+        use crate::core::paths::{ensure_persistent_state_layout, service_paths};
+        use crate::core::process::process_identity;
+        use std::path::PathBuf;
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        struct Cleanup {
+            child: Child,
+            session_id: u64,
+            record_path: PathBuf,
+            attached: bool,
+        }
+
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                if self.attached {
+                    let _ = wfp::remove();
+                    let _ = driver_detach_blocking(self.session_id);
+                }
+                let _ = std::fs::remove_file(&self.record_path);
+            }
+        }
+
+        let proxy_port: u16 = std::env::var("CLASH5_M5_MIHOMO_PORT")?.parse()?;
+        let target_port: u16 = std::env::var("CLASH5_M5_TARGET_PORT")?.parse()?;
+        let token = std::env::var("CLASH5_M5_CHAIN_TOKEN")?;
+        let session_id = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos(),
+        )?;
+        let relay = TcpRedirectRelay::bind(session_id, proxy_port, &token).await?;
+        let relay_port = relay.port()?;
+        let (stop_relay, relay_shutdown) = tokio::sync::oneshot::channel();
+        let relay_task = tokio::spawn(relay.run(relay_shutdown));
+
+        let script = r#"Start-Sleep -Seconds 5; $client = [Net.Sockets.TcpClient]::new([Net.Sockets.AddressFamily]::InterNetwork); $client.ReceiveTimeout = 10000; $client.Connect('127.0.0.1', TARGET_PORT); $stream = $client.GetStream(); $request = [Text.Encoding]::ASCII.GetBytes("GET /ip HTTP/1.1`r`nHost: 127.0.0.1`r`nConnection: close`r`n`r`n"); $stream.Write($request, 0, $request.Length); $reader = [IO.StreamReader]::new($stream); $response = $reader.ReadToEnd(); $client.Dispose(); if ($response -notmatch '203\.0\.113\.27') { exit 9 }"#
+            .replace("TARGET_PORT", &target_port.to_string());
+        let child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        let identity = process_identity(child.id())?.ok_or_else(|| anyhow::anyhow!("target exited before attach"))?;
+        ensure_persistent_state_layout()?;
+        let mut cleanup = Cleanup {
+            child,
+            session_id,
+            record_path: service_paths()?.process_proxy_session_path(),
+            attached: true,
+        };
+        let owner = crate::core::auth::AuthenticatedOwner {
+            key: "chain-smoke".to_owned(),
+            identity: crate::OwnerIdentity::Windows {
+                sid: "chain-smoke".to_owned(),
+            },
+            app_data_root: PathBuf::new(),
+        };
+        let mut active = crate::core::desired::ActiveOwnerState::from(&owner);
+        active.generation = session_id;
+        let request = ProcessProxyAttachRequest {
+            relay_pid: std::process::id(),
+            relay_port,
+            targets: vec![ProcessProxyTarget {
+                pid: cleanup.child.id(),
+                created_at: identity.started_at,
+            }],
+        };
+        anyhow::ensure!(
+            matches!(
+                super::attach_process_proxy(&owner, &active, &request).await?,
+                ProcessProxySessionStatus::Active { .. }
+            ),
+            "service did not attach the Chain test target"
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let exit = loop {
+            if let Some(exit) = cleanup.child.try_wait()? {
+                break exit;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "Chain test target timed out");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        anyhow::ensure!(
+            exit.success(),
+            "Chain test target did not receive the expected response"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while super::load_record().await?.is_some() {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "service did not detach the Chain test target"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        anyhow::ensure!(!wfp::is_active(), "Chain test left WFP filters active");
+        cleanup.attached = false;
+        let _ = stop_relay.send(());
+        tokio::time::timeout(Duration::from_secs(5), relay_task).await???;
+        Ok(())
+    }
+
     #[cfg(windows)]
     #[test]
     fn driver_attach_layout_matches_kernel_protocol() {
