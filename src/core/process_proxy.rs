@@ -176,7 +176,19 @@ pub async fn process_proxy_status(owner: &AuthenticatedOwner, active: &ActiveOwn
         Ok(Some(record)) if record.session.owner_key == owner.key && record.session.session_id == active.generation => {
             match record.phase {
                 RecoveryPhase::Active => {
-                    if !policy_is_active().await {
+                    let targets_live = active_target_present(&record.session).await;
+                    if matches!(targets_live, Ok(false)) {
+                        match clear_recorded_session(record.session.session_id).await {
+                            Ok(()) => ProcessProxySessionStatus::Idle,
+                            Err(error) => ProcessProxySessionStatus::RecoveryRequired {
+                                detail: format!("failed to detach exited process-proxy targets: {error:#}"),
+                            },
+                        }
+                    } else if targets_live.is_err() {
+                        ProcessProxySessionStatus::RecoveryRequired {
+                            detail: "the selected process identities cannot be verified".to_owned(),
+                        }
+                    } else if !policy_is_active().await {
                         ProcessProxySessionStatus::RecoveryRequired {
                             detail: "the WFP redirect filters are unavailable".to_owned(),
                         }
@@ -214,6 +226,27 @@ fn relay_listeners_present(_session: &ProcessProxySession) -> bool {
     false
 }
 
+#[cfg(windows)]
+async fn active_target_present(session: &ProcessProxySession) -> Result<bool> {
+    let targets = session.targets.clone();
+    tokio::task::spawn_blocking(move || {
+        for target in targets {
+            if crate::core::process::process_identity(target.pid)?
+                .is_some_and(|identity| identity.started_at == target.created_at)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
+    .await?
+}
+
+#[cfg(not(windows))]
+async fn active_target_present(_session: &ProcessProxySession) -> Result<bool> {
+    Ok(true)
+}
+
 /// Runs before restoring normal service work. A surviving record is never assumed idle:
 /// the service first asks the driver to detach it, then removes the record.
 pub async fn reconcile_process_proxy_session() -> Result<()> {
@@ -221,8 +254,12 @@ pub async fn reconcile_process_proxy_session() -> Result<()> {
     let Some(record) = load_record().await? else {
         return Ok(());
     };
+    clear_recorded_session(record.session.session_id).await
+}
+
+async fn clear_recorded_session(session_id: u64) -> Result<()> {
     policy_remove().await.map_err(|error| anyhow::anyhow!(error.message))?;
-    driver_detach(record.session.session_id)
+    driver_detach(session_id)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))?;
     clear_record().await?;
@@ -481,7 +518,7 @@ fn send_driver_ioctl<T>(code: u32, request: &T) -> std::result::Result<(), Servi
 #[cfg(test)]
 mod tests {
     use super::{RecoveryPhase, RecoveryRecord, validate_request};
-    use crate::{ProcessProxyAttachRequest, ProcessProxySession, ProcessProxyTarget};
+    use crate::{ProcessProxyAttachRequest, ProcessProxySession, ProcessProxySessionStatus, ProcessProxyTarget};
 
     #[cfg(windows)]
     #[test]
@@ -801,7 +838,7 @@ mod tests {
                 pid: cleanup.child.id(),
                 created_at: recovery_identity.started_at,
             }],
-            ..session
+            ..session.clone()
         };
         driver_attach_blocking(&recovery_session)?;
         cleanup.attached = true;
@@ -819,6 +856,65 @@ mod tests {
         anyhow::ensure!(
             super::load_record().await?.is_none(),
             "recovery left its session record"
+        );
+        cleanup.attached = false;
+        cleanup.policy = false;
+        cleanup.record_path = None;
+
+        let _ = cleanup.child.kill();
+        let _ = cleanup.child.wait();
+        cleanup.child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 3"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        cleanup.session_id = session_id + 2;
+        let exit_identity =
+            process_identity(cleanup.child.id())?.ok_or_else(|| anyhow::anyhow!("exit target ended before attach"))?;
+        let exit_session = ProcessProxySession {
+            session_id: cleanup.session_id,
+            targets: vec![ProcessProxyTarget {
+                pid: cleanup.child.id(),
+                created_at: exit_identity.started_at,
+            }],
+            ..session.clone()
+        };
+        driver_attach_blocking(&exit_session)?;
+        cleanup.attached = true;
+        wfp::install()?;
+        cleanup.policy = true;
+        cleanup.record_path = Some(service_paths()?.process_proxy_session_path());
+        super::persist_record(&RecoveryRecord {
+            phase: RecoveryPhase::Active,
+            session: exit_session,
+        })
+        .await?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cleanup.child.try_wait()?.is_none() {
+            anyhow::ensure!(Instant::now() < deadline, "exit target did not finish");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let owner = crate::core::auth::AuthenticatedOwner {
+            key: "smoke".to_owned(),
+            identity: crate::OwnerIdentity::Windows {
+                sid: "smoke".to_owned(),
+            },
+            app_data_root: PathBuf::new(),
+        };
+        let mut active = crate::core::desired::ActiveOwnerState::from(&owner);
+        active.generation = cleanup.session_id;
+        anyhow::ensure!(
+            matches!(
+                super::process_proxy_status(&owner, &active).await,
+                ProcessProxySessionStatus::Idle
+            ),
+            "status did not detach an exited target session"
+        );
+        anyhow::ensure!(!wfp::is_active(), "target exit left WFP filters active");
+        anyhow::ensure!(
+            super::load_record().await?.is_none(),
+            "target exit left its session record"
         );
         cleanup.attached = false;
         cleanup.policy = false;
