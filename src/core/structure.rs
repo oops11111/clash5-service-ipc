@@ -76,6 +76,11 @@ impl ProtocolInfo {
         self.protocol.epoch == ProtocolVersion::current().epoch
             && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_PROCESS_PROXY
     }
+
+    pub const fn supports_process_proxy_updates(&self) -> bool {
+        self.protocol.epoch == ProtocolVersion::current().epoch
+            && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_PROCESS_PROXY_UPDATE
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +191,12 @@ pub struct ProcessProxyTarget {
 pub struct ProcessProxyAttachRequest {
     pub relay_pid: u32,
     pub relay_port: u16,
+    pub targets: Vec<ProcessProxyTarget>,
+}
+
+/// Replaces the exact targets of an already attached process-proxy session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessProxyUpdateRequest {
     pub targets: Vec<ProcessProxyTarget>,
 }
 
@@ -465,6 +476,10 @@ mod tests {
         older.protocol.revision = crate::MIN_SERVICE_REVISION_FOR_PROCESS_PROXY - 1;
         assert!(!older.supports_process_proxy());
         assert!(ProtocolInfo::current().supports_process_proxy());
+
+        older.protocol.revision = crate::MIN_SERVICE_REVISION_FOR_PROCESS_PROXY_UPDATE - 1;
+        assert!(!older.supports_process_proxy_updates());
+        assert!(ProtocolInfo::current().supports_process_proxy_updates());
     }
 
     #[test]

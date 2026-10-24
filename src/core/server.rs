@@ -15,12 +15,13 @@ use crate::core::status::service_status_snapshot;
 use crate::core::structure::{OwnerSessionProof, Response, ServiceLifecycleState};
 use crate::core::{
     apply_proxy, apply_proxy_or_direct, attach_process_proxy, clear_proxy, clear_proxy_waiting_for_network,
-    detach_process_proxy, process_proxy_status, validate_proxy_config,
+    detach_process_proxy, process_proxy_status, update_process_proxy_targets, validate_proxy_config,
 };
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IpcCommand, MIN_SUPPORTED_CLIENT_REVISION, MacosProxyConfig,
-    OwnerSessionHandle, ProcessProxyAttachRequest, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeBundle,
-    RuntimeFileRequest, SERVICE_PROTOCOL_HEADER, StartClashRequest, StartClashResult, WriterConfig,
+    OwnerSessionHandle, ProcessProxyAttachRequest, ProcessProxyUpdateRequest, ProtocolInfo, ProtocolVersion,
+    ProxyApplyOutcome, RuntimeBundle, RuntimeFileRequest, SERVICE_PROTOCOL_HEADER, StartClashRequest, StartClashResult,
+    WriterConfig,
 };
 use anyhow::{Context as _, Result as AnyResult, anyhow};
 use http::StatusCode;
@@ -892,6 +893,27 @@ fn create_ipc_router() -> Result<Router> {
                 Err(error) => return service_error(error),
             };
             match attach_process_proxy(&owner, &active, &request.payload).await {
+                Ok(status) => ok_json(status),
+                Err(error) => service_error(error),
+            }
+        })
+        .put(IpcCommand::ProcessProxySession.as_ref(), |ctx| async move {
+            trace!("Received ProcessProxySession target update command");
+            let (request, owner) =
+                match authenticate_request::<AuthenticatedSessionRequest<ProcessProxyUpdateRequest>>(&ctx) {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
+            let _lifecycle_guard =
+                match enter_owner_lifecycle(&owner, OwnerLifecycleGate::ActiveSession(&request.session)).await {
+                    ControlFlow::Continue(guard) => guard,
+                    ControlFlow::Break(response) => return response,
+                };
+            let active = match require_active_session(&owner, &request.session).await {
+                Ok(active) => active,
+                Err(error) => return service_error(error),
+            };
+            match update_process_proxy_targets(&owner, &active, &request.payload).await {
                 Ok(status) => ok_json(status),
                 Err(error) => service_error(error),
             }

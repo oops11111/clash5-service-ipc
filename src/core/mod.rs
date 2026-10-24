@@ -6,10 +6,10 @@ pub use structure::{
     AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, CoreAvailability, CoreConfig, CoreInspection,
     CoreRequirement, InstallationStatus, MacosProxyConfig, OWNER_TOKEN_FILE_NAME, OwnerCredentials, OwnerIdentity,
     OwnerSessionHandle, OwnerSessionProof, PROCESS_PROXY_MAX_TARGETS, ProcessProxyAttachRequest, ProcessProxySession,
-    ProcessProxySessionStatus, ProcessProxyTarget, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RemoteProvider,
-    RuntimeAsset, RuntimeBundle, RuntimeFileOutcome, RuntimeFileRequest, SERVICE_PROTOCOL_HEADER,
-    SESSION_TOKEN_HEX_LEN, ServiceErrorCode, ServiceLifecycleState, ServiceStatusSnapshot, StageRejection,
-    StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig, owner_key,
+    ProcessProxySessionStatus, ProcessProxyTarget, ProcessProxyUpdateRequest, ProtocolInfo, ProtocolVersion,
+    ProxyApplyOutcome, RemoteProvider, RuntimeAsset, RuntimeBundle, RuntimeFileOutcome, RuntimeFileRequest,
+    SERVICE_PROTOCOL_HEADER, SESSION_TOKEN_HEX_LEN, ServiceErrorCode, ServiceLifecycleState, ServiceStatusSnapshot,
+    StageRejection, StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig, owner_key,
 };
 
 pub mod paths;
@@ -87,6 +87,7 @@ pub use owner::{ServiceOwnerGuard, acquire_service_owner};
 #[cfg(feature = "standalone")]
 pub use process_proxy::{
     attach_process_proxy, detach_process_proxy, process_proxy_status, reconcile_process_proxy_session,
+    update_process_proxy_targets,
 };
 #[cfg(feature = "standalone")]
 pub use proxy::{

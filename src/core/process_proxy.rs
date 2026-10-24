@@ -1,7 +1,10 @@
 use crate::core::auth::{AuthenticatedOwner, ServiceError};
 use crate::core::desired::ActiveOwnerState;
 use crate::core::paths::service_paths;
-use crate::{PROCESS_PROXY_MAX_TARGETS, ProcessProxyAttachRequest, ProcessProxySession, ProcessProxySessionStatus};
+use crate::{
+    PROCESS_PROXY_MAX_TARGETS, ProcessProxyAttachRequest, ProcessProxySession, ProcessProxySessionStatus,
+    ProcessProxyTarget, ProcessProxyUpdateRequest,
+};
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::{
@@ -16,7 +19,7 @@ mod relay_listener;
 #[cfg(windows)]
 mod wfp;
 
-const DRIVER_PROTOCOL_VERSION: u32 = 2;
+const DRIVER_PROTOCOL_VERSION: u32 = 3;
 static RECOVERY_REQUIRED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -112,6 +115,77 @@ pub async fn attach_process_proxy(
     #[cfg(windows)]
     tokio::spawn(monitor_session(session.owner_key.clone(), session.session_id));
     Ok(ProcessProxySessionStatus::Active { session })
+}
+
+/// Replaces the selected exact instances without removing the active WFP filters.
+pub async fn update_process_proxy_targets(
+    owner: &AuthenticatedOwner,
+    active: &ActiveOwnerState,
+    request: &ProcessProxyUpdateRequest,
+) -> std::result::Result<ProcessProxySessionStatus, ServiceError> {
+    let _operation = operation_lock().lock().await;
+    if RECOVERY_REQUIRED.load(Ordering::Acquire) {
+        return Err(ServiceError::process_proxy_recovery_required(
+            "a previous process-proxy operation requires recovery",
+        ));
+    }
+    let Some(record) = load_record().await.map_err(recovery_read_error)? else {
+        return Err(ServiceError::invalid_process_proxy_session(
+            "no process-proxy session is attached",
+        ));
+    };
+    if record.phase != RecoveryPhase::Active
+        || record.session.owner_key != owner.key
+        || record.session.session_id != active.generation
+    {
+        return Err(ServiceError::process_proxy_recovery_required(
+            "the recorded process-proxy session is not active for this owner",
+        ));
+    }
+    validate_targets(&request.targets, record.session.relay_pid)?;
+    #[cfg(windows)]
+    if let Err(error) = relay_listener::verify(record.session.relay_pid, record.session.relay_port) {
+        return Err(rollback_failed_update(record.session.session_id, error).await);
+    }
+    if !policy_is_active().await {
+        return Err(rollback_failed_update(
+            record.session.session_id,
+            ServiceError::process_proxy_recovery_required("the WFP redirect filters are unavailable"),
+        )
+        .await);
+    }
+    let mut session = record.session;
+    session.targets = request.targets.clone();
+    if let Err(error) = driver_update(&session).await {
+        return Err(rollback_failed_update(session.session_id, error).await);
+    }
+    if let Err(error) = persist_record(&RecoveryRecord {
+        phase: RecoveryPhase::Active,
+        session: session.clone(),
+    })
+    .await
+    {
+        return Err(rollback_failed_update(
+            session.session_id,
+            ServiceError::process_proxy_recovery_required(format!(
+                "the updated target set could not be persisted: {error:#}"
+            )),
+        )
+        .await);
+    }
+    Ok(ProcessProxySessionStatus::Active { session })
+}
+
+async fn rollback_failed_update(session_id: u64, error: ServiceError) -> ServiceError {
+    match clear_recorded_session(session_id).await {
+        Ok(()) => error,
+        Err(cleanup_error) => {
+            RECOVERY_REQUIRED.store(true, Ordering::Release);
+            ServiceError::process_proxy_recovery_required(format!(
+                "process-proxy target update failed: {error}; session cleanup failed: {cleanup_error:#}"
+            ))
+        }
+    }
 }
 
 async fn rollback_failed_attach(session_id: u64, error: ServiceError) -> ServiceError {
@@ -312,19 +386,23 @@ fn validate_request(request: &ProcessProxyAttachRequest) -> std::result::Result<
             "relay PID and loopback port are required",
         ));
     }
-    if request.targets.is_empty() || request.targets.len() > PROCESS_PROXY_MAX_TARGETS {
+    validate_targets(&request.targets, request.relay_pid)
+}
+
+fn validate_targets(targets: &[ProcessProxyTarget], relay_pid: u32) -> std::result::Result<(), ServiceError> {
+    if targets.is_empty() || targets.len() > PROCESS_PROXY_MAX_TARGETS {
         return Err(ServiceError::invalid_process_proxy_session(format!(
             "target count must be between 1 and {PROCESS_PROXY_MAX_TARGETS}"
         )));
     }
     let mut seen = std::collections::BTreeSet::new();
-    for target in &request.targets {
+    for target in targets {
         if target.pid == 0 || target.created_at == 0 {
             return Err(ServiceError::invalid_process_proxy_session(
                 "each target requires a PID and creation timestamp",
             ));
         }
-        if target.pid == request.relay_pid {
+        if target.pid == relay_pid {
             return Err(ServiceError::invalid_process_proxy_session(
                 "the relay process cannot be a redirected target",
             ));
@@ -423,6 +501,21 @@ async fn driver_attach(_session: &ProcessProxySession) -> std::result::Result<()
 }
 
 #[cfg(windows)]
+async fn driver_update(session: &ProcessProxySession) -> std::result::Result<(), ServiceError> {
+    let session = session.clone();
+    tokio::task::spawn_blocking(move || driver_update_blocking(&session))
+        .await
+        .map_err(|error| ServiceError::process_proxy_unavailable(format!("driver update worker failed: {error}")))?
+}
+
+#[cfg(not(windows))]
+async fn driver_update(_session: &ProcessProxySession) -> std::result::Result<(), ServiceError> {
+    Err(ServiceError::process_proxy_unavailable(
+        "process proxy is only available in the Windows service",
+    ))
+}
+
+#[cfg(windows)]
 async fn driver_detach(session_id: u64) -> std::result::Result<(), ServiceError> {
     tokio::task::spawn_blocking(move || driver_detach_blocking(session_id))
         .await
@@ -465,9 +558,22 @@ struct DriverDetachRequest {
 }
 
 #[cfg(windows)]
+#[repr(C)]
+struct DriverUpdateRequest {
+    version: u32,
+    size: u32,
+    session_id: u64,
+    target_count: u32,
+    reserved: u32,
+    targets: [DriverTarget; PROCESS_PROXY_MAX_TARGETS],
+}
+
+#[cfg(windows)]
 const IOCTL_ATTACH_SESSION: u32 = 0x0012_a004;
 #[cfg(windows)]
 const IOCTL_DETACH_SESSION: u32 = 0x0012_a008;
+#[cfg(windows)]
+const IOCTL_UPDATE_TARGETS: u32 = 0x0012_a00c;
 
 #[cfg(windows)]
 fn driver_attach_blocking(session: &ProcessProxySession) -> std::result::Result<(), ServiceError> {
@@ -487,6 +593,25 @@ fn driver_attach_blocking(session: &ProcessProxySession) -> std::result::Result<
         };
     }
     send_driver_ioctl(IOCTL_ATTACH_SESSION, &request)
+}
+
+#[cfg(windows)]
+fn driver_update_blocking(session: &ProcessProxySession) -> std::result::Result<(), ServiceError> {
+    let mut request = DriverUpdateRequest {
+        version: DRIVER_PROTOCOL_VERSION,
+        size: std::mem::size_of::<DriverUpdateRequest>() as u32,
+        session_id: session.session_id,
+        target_count: session.targets.len() as u32,
+        reserved: 0,
+        targets: [DriverTarget { pid: 0, created_at: 0 }; PROCESS_PROXY_MAX_TARGETS],
+    };
+    for (index, target) in session.targets.iter().enumerate() {
+        request.targets[index] = DriverTarget {
+            pid: target.pid as u64,
+            created_at: target.created_at,
+        };
+    }
+    send_driver_ioctl(IOCTL_UPDATE_TARGETS, &request)
 }
 
 #[cfg(windows)]
@@ -1079,10 +1204,99 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn driver_attach_layout_matches_kernel_protocol() {
-        use super::{DriverAttachRequest, DriverTarget};
+        use super::{DriverAttachRequest, DriverTarget, DriverUpdateRequest};
 
         assert_eq!(std::mem::size_of::<DriverTarget>(), 16);
         assert_eq!(std::mem::size_of::<DriverAttachRequest>(), 2072);
+        assert_eq!(std::mem::size_of::<DriverUpdateRequest>(), 2072);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an elevated Windows host with the clash5 WFP driver loaded"]
+    fn driver_target_update_checks_exact_instances_and_session() -> anyhow::Result<()> {
+        use super::{driver_attach_blocking, driver_detach_blocking, driver_update_blocking};
+        use crate::core::process::process_identity;
+        use std::process::{Child, Command, Stdio};
+
+        struct Cleanup {
+            children: Vec<Child>,
+            session_id: u64,
+            attached: bool,
+        }
+
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if self.attached {
+                    let _ = driver_detach_blocking(self.session_id);
+                }
+                for child in &mut self.children {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let mut cleanup = Cleanup {
+            children: Vec::new(),
+            session_id: 0,
+            attached: false,
+        };
+        for _ in 0..2 {
+            cleanup.children.push(
+                Command::new("powershell.exe")
+                    .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()?,
+            );
+        }
+        let targets = cleanup
+            .children
+            .iter()
+            .map(|child| {
+                let identity = process_identity(child.id())?
+                    .ok_or_else(|| anyhow::anyhow!("target exited before the update test"))?;
+                Ok(ProcessProxyTarget {
+                    pid: child.id(),
+                    created_at: identity.started_at,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        cleanup.session_id = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos(),
+        )?;
+        let mut session = ProcessProxySession {
+            owner_key: "smoke".to_owned(),
+            session_id: cleanup.session_id,
+            relay_pid: std::process::id(),
+            relay_port: 1,
+            targets: vec![targets[0].clone()],
+        };
+        driver_attach_blocking(&session)?;
+        cleanup.attached = true;
+
+        session.targets = vec![targets[1].clone()];
+        driver_update_blocking(&session)?;
+        let mut wrong_session = session.clone();
+        wrong_session.session_id += 1;
+        anyhow::ensure!(
+            driver_update_blocking(&wrong_session).is_err(),
+            "foreign session update succeeded"
+        );
+        let mut stale_target = session.clone();
+        stale_target.targets[0].created_at += 1;
+        anyhow::ensure!(
+            driver_update_blocking(&stale_target).is_err(),
+            "stale target update succeeded"
+        );
+        driver_update_blocking(&session)?;
+        driver_detach_blocking(session.session_id)?;
+        cleanup.attached = false;
+        Ok(())
     }
 
     fn request() -> ProcessProxyAttachRequest {

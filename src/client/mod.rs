@@ -20,8 +20,9 @@ pub use redirect_relay::TcpRedirectRelay;
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand,
     MIN_REQUIRED_SERVICE_REVISION, MacosProxyConfig, OwnerCredentials, OwnerSessionProof, ProcessProxyAttachRequest,
-    ProcessProxySessionStatus, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, RuntimeFileOutcome,
-    RuntimeFileRequest, ServiceStatusSnapshot, StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig,
+    ProcessProxySessionStatus, ProcessProxyUpdateRequest, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome,
+    RuntimeBundle, RuntimeFileOutcome, RuntimeFileRequest, ServiceStatusSnapshot, StageRuntimeOutcome,
+    StartClashRequest, StartClashResult, WriterConfig,
     core::structure::{JsonConvert, Response},
 };
 
@@ -293,6 +294,23 @@ pub async fn attach_process_proxy(
 ) -> Result<Response<ProcessProxySessionStatus>> {
     protected_call(
         Verb::Post,
+        IpcCommand::ProcessProxySession,
+        credentials,
+        Some(session),
+        body.clone(),
+        Some(LIFECYCLE_TIMEOUT),
+    )
+    .await
+}
+
+/// Replaces the active Windows process-proxy session's exact target set.
+pub async fn update_process_proxy_targets(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+    body: &ProcessProxyUpdateRequest,
+) -> Result<Response<ProcessProxySessionStatus>> {
+    protected_call(
+        Verb::Put,
         IpcCommand::ProcessProxySession,
         credentials,
         Some(session),
