@@ -455,6 +455,9 @@ impl CoreManager {
     /// Stops the core; IPC handlers pass the deadline by which it must be SIGKILLed.
     pub(super) async fn stop_core_by(&self, kill_by: Option<Instant>) -> Result<()> {
         info!("Stopping core");
+        crate::core::process_proxy::reconcile_process_proxy_session()
+            .await
+            .context("failed to detach process proxy before stopping core")?;
         LOG_RING.clear_logs();
 
         let watchdog_result = self.stop_watchdog(kill_by).await;
@@ -565,6 +568,11 @@ impl CoreManager {
                 running_pid_arc.store(0, Ordering::Release);
                 started_at_arc.store(0, Ordering::Relaxed);
                 remove_core_runtime_record().await;
+                if let Err(error) = crate::core::process_proxy::reconcile_process_proxy_session().await {
+                    error!("Failed to detach process proxy after core exit: {error:#}");
+                    recovery_exhausted = true;
+                    break 'watchdog;
+                }
 
                 let now = Instant::now();
                 restart_timestamps.retain(|t| now.duration_since(*t) < watchdog_config.restart_window);

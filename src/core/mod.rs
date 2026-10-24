@@ -5,10 +5,11 @@ pub mod structure;
 pub use structure::{
     AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, CoreAvailability, CoreConfig, CoreInspection,
     CoreRequirement, InstallationStatus, MacosProxyConfig, OWNER_TOKEN_FILE_NAME, OwnerCredentials, OwnerIdentity,
-    OwnerSessionHandle, OwnerSessionProof, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RemoteProvider,
-    RuntimeAsset, RuntimeBundle, RuntimeFileOutcome, RuntimeFileRequest, SERVICE_PROTOCOL_HEADER,
-    SESSION_TOKEN_HEX_LEN, ServiceErrorCode, ServiceLifecycleState, ServiceStatusSnapshot, StageRejection,
-    StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig, owner_key,
+    OwnerSessionHandle, OwnerSessionProof, PROCESS_PROXY_MAX_TARGETS, ProcessProxyAttachRequest, ProcessProxySession,
+    ProcessProxySessionStatus, ProcessProxyTarget, ProcessProxyUpdateRequest, ProtocolInfo, ProtocolVersion,
+    ProxyApplyOutcome, RemoteProvider, RuntimeAsset, RuntimeBundle, RuntimeFileOutcome, RuntimeFileRequest,
+    SERVICE_PROTOCOL_HEADER, SESSION_TOKEN_HEX_LEN, ServiceErrorCode, ServiceLifecycleState, ServiceStatusSnapshot,
+    StageRejection, StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig, owner_key,
 };
 
 pub mod paths;
@@ -38,6 +39,8 @@ mod manager;
 mod owner;
 #[cfg(feature = "standalone")]
 mod process;
+#[cfg(feature = "standalone")]
+mod process_proxy;
 #[cfg(feature = "standalone")]
 mod proxy;
 #[cfg(feature = "standalone")]
@@ -81,6 +84,11 @@ pub use maintenance::{cleanup_stale_owner_state, repair_active_owner_state};
 pub use manager::{CoreWatchdogTestConfig, set_core_watchdog_config_for_tests};
 #[cfg(feature = "standalone")]
 pub use owner::{ServiceOwnerGuard, acquire_service_owner};
+#[cfg(feature = "standalone")]
+pub use process_proxy::{
+    attach_process_proxy, detach_process_proxy, process_proxy_status, reconcile_process_proxy_session,
+    update_process_proxy_targets,
+};
 #[cfg(feature = "standalone")]
 pub use proxy::{
     apply_proxy, apply_proxy_or_direct, clear_proxy, clear_proxy_waiting_for_network, validate_proxy_config,

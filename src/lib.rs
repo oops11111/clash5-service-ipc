@@ -15,21 +15,24 @@ pub use channel::{
 pub use core::{
     AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, CoreAvailability, CoreConfig, CoreInspection,
     CoreRequirement, InstallationStatus, IpcCommand, MacosProxyConfig, OWNER_TOKEN_FILE_NAME, OwnerCredentials,
-    OwnerIdentity, OwnerSessionHandle, OwnerSessionProof, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome,
-    RemoteProvider, RuntimeAsset, RuntimeBundle, RuntimeFileOutcome, RuntimeFileRequest, SERVICE_PROTOCOL_HEADER,
-    SESSION_TOKEN_HEX_LEN, ServiceErrorCode, ServiceLifecycleState, ServiceStatusSnapshot, StageRejection,
-    StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig, mihomo_ipc_path, owner_key,
+    OwnerIdentity, OwnerSessionHandle, OwnerSessionProof, PROCESS_PROXY_MAX_TARGETS, ProcessProxyAttachRequest,
+    ProcessProxySession, ProcessProxySessionStatus, ProcessProxyTarget, ProcessProxyUpdateRequest, ProtocolInfo,
+    ProtocolVersion, ProxyApplyOutcome, RemoteProvider, RuntimeAsset, RuntimeBundle, RuntimeFileOutcome,
+    RuntimeFileRequest, SERVICE_PROTOCOL_HEADER, SESSION_TOKEN_HEX_LEN, ServiceErrorCode, ServiceLifecycleState,
+    ServiceStatusSnapshot, StageRejection, StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig,
+    mihomo_ipc_path, owner_key,
 };
 pub use core::{CORE_DISPLACED_EXTENSION, CORE_STAGING_EXTENSION, OwnerPaths, ServicePaths, service_paths};
 
 #[cfg(feature = "standalone")]
 pub use core::{
     ActiveOwnerState, DesiredState, REPAIR_IN_PROGRESS_EXIT_CODE, ServiceOwnerGuard, ServiceRepairGate,
-    acquire_service_owner, acquire_service_repair_gate, cleanup_stale_owner_state, flush_service_log,
-    init_service_logging, load_active_owner, load_owner_desired_state, prepare_core_install_directory,
-    prepare_service_install_directory, reconcile_service_startup, repair_active_owner_state,
-    require_trusted_core_source, restore_desired_state, run_ipc_server, run_ipc_supervisor_until_shutdown,
-    service_lifecycle_state, set_service_lifecycle_state, stop_ipc_server,
+    acquire_service_owner, acquire_service_repair_gate, attach_process_proxy, cleanup_stale_owner_state,
+    detach_process_proxy, flush_service_log, init_service_logging, load_active_owner, load_owner_desired_state,
+    prepare_core_install_directory, prepare_service_install_directory, process_proxy_status,
+    reconcile_process_proxy_session, reconcile_service_startup, repair_active_owner_state, require_trusted_core_source,
+    restore_desired_state, run_ipc_server, run_ipc_supervisor_until_shutdown, service_lifecycle_state,
+    set_service_lifecycle_state, stop_ipc_server, update_process_proxy_targets,
 };
 
 #[cfg(feature = "test")]
@@ -41,6 +44,11 @@ pub use core::{CoreWatchdogTestConfig, set_core_watchdog_config_for_tests};
 
 #[cfg(feature = "client")]
 pub use client::*;
+#[cfg(feature = "client")]
+pub use client::{
+    attach_process_proxy as request_process_proxy_attach, detach_process_proxy as request_process_proxy_detach,
+    update_process_proxy_targets as request_process_proxy_update,
+};
 
 #[cfg(all(target_os = "macos", not(feature = "test"), not(feature = "development-channel")))]
 pub static IPC_PATH: &str = "/var/run/clash-verge-service/service.sock";
@@ -76,7 +84,7 @@ pub static IPC_AUTH_EXPECT: &str =
 
 pub static VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROTOCOL_EPOCH: u16 = 2;
-pub const PROTOCOL_REVISION: u16 = 5;
+pub const PROTOCOL_REVISION: u16 = 7;
 pub const MIN_SUPPORTED_CLIENT_REVISION: u16 = 5;
 pub const MIN_REQUIRED_SERVICE_REVISION: u16 = 5;
 /// Revision that introduced `/clash/stage-runtime`.
@@ -84,3 +92,6 @@ pub const MIN_REQUIRED_SERVICE_REVISION: u16 = 5;
 pub const MIN_SERVICE_REVISION_FOR_RUNTIME_STAGING: u16 = 2;
 /// Capability revision for `/clash/runtime-file`.
 pub const MIN_SERVICE_REVISION_FOR_RUNTIME_FILE_READ: u16 = 3;
+/// Capability revision for authenticated Windows process-proxy sessions.
+pub const MIN_SERVICE_REVISION_FOR_PROCESS_PROXY: u16 = 6;
+pub const MIN_SERVICE_REVISION_FOR_PROCESS_PROXY_UPDATE: u16 = 7;
