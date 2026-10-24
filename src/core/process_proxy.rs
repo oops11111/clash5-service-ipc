@@ -785,6 +785,44 @@ mod tests {
         cleanup.attached = false;
         cleanup.policy = false;
         cleanup.record_path = None;
+
+        cleanup.child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 20"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        cleanup.session_id = session_id + 1;
+        let recovery_identity = process_identity(cleanup.child.id())?
+            .ok_or_else(|| anyhow::anyhow!("recovery target exited before attach"))?;
+        let recovery_session = ProcessProxySession {
+            session_id: cleanup.session_id,
+            targets: vec![ProcessProxyTarget {
+                pid: cleanup.child.id(),
+                created_at: recovery_identity.started_at,
+            }],
+            ..session
+        };
+        driver_attach_blocking(&recovery_session)?;
+        cleanup.attached = true;
+        wfp::install()?;
+        cleanup.policy = true;
+        anyhow::ensure!(wfp::is_active(), "recovery fixture did not install WFP filters");
+        cleanup.record_path = Some(service_paths()?.process_proxy_session_path());
+        super::persist_record(&RecoveryRecord {
+            phase: RecoveryPhase::Active,
+            session: recovery_session,
+        })
+        .await?;
+        super::reconcile_process_proxy_session().await?;
+        anyhow::ensure!(!wfp::is_active(), "recovery left WFP filters active");
+        anyhow::ensure!(
+            super::load_record().await?.is_none(),
+            "recovery left its session record"
+        );
+        cleanup.attached = false;
+        cleanup.policy = false;
+        cleanup.record_path = None;
         let _ = stop_relay.send(());
         tokio::time::timeout(Duration::from_secs(5), relay_task).await???;
         Ok(())
