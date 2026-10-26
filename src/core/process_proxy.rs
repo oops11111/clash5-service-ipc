@@ -34,6 +34,8 @@ enum RecoveryPhase {
 struct RecoveryRecord {
     #[serde(default)]
     phase: RecoveryPhase,
+    #[serde(default)]
+    relay_created_at: u64,
     #[serde(flatten)]
     session: ProcessProxySession,
 }
@@ -72,7 +74,9 @@ pub async fn attach_process_proxy(
         }
     }
     #[cfg(windows)]
-    relay_listener::verify(request.relay_pid, request.relay_port)?;
+    let relay_created_at = relay_listener::verify_exact(request.relay_pid, request.relay_port, None)?;
+    #[cfg(not(windows))]
+    let relay_created_at = 0;
 
     let session = ProcessProxySession {
         owner_key: owner.key.clone(),
@@ -83,6 +87,7 @@ pub async fn attach_process_proxy(
     };
     persist_record(&RecoveryRecord {
         phase: RecoveryPhase::Pending,
+        relay_created_at,
         session: session.clone(),
     })
     .await
@@ -105,8 +110,13 @@ pub async fn attach_process_proxy(
         )
         .await);
     }
+    #[cfg(windows)]
+    if let Err(error) = relay_listener::verify_exact(session.relay_pid, session.relay_port, Some(relay_created_at)) {
+        return Err(rollback_failed_attach(session.session_id, error).await);
+    }
     if let Err(error) = persist_record(&RecoveryRecord {
         phase: RecoveryPhase::Active,
+        relay_created_at,
         session: session.clone(),
     })
     .await
@@ -151,7 +161,11 @@ pub async fn update_process_proxy_targets(
     }
     validate_targets(&request.targets, record.session.relay_pid)?;
     #[cfg(windows)]
-    if let Err(error) = relay_listener::verify(record.session.relay_pid, record.session.relay_port) {
+    if let Err(error) = relay_listener::verify_exact(
+        record.session.relay_pid,
+        record.session.relay_port,
+        Some(record.relay_created_at),
+    ) {
         return Err(rollback_failed_update(record.session.session_id, error).await);
     }
     if !policy_is_active().await {
@@ -173,8 +187,15 @@ pub async fn update_process_proxy_targets(
         )
         .await);
     }
+    #[cfg(windows)]
+    if let Err(error) =
+        relay_listener::verify_exact(session.relay_pid, session.relay_port, Some(record.relay_created_at))
+    {
+        return Err(rollback_failed_update(session.session_id, error).await);
+    }
     if let Err(error) = persist_record(&RecoveryRecord {
         phase: RecoveryPhase::Active,
+        relay_created_at: record.relay_created_at,
         session: session.clone(),
     })
     .await
@@ -289,7 +310,7 @@ pub async fn process_proxy_status(owner: &AuthenticatedOwner, active: &ActiveOwn
                             detail: "the driver session is unavailable or differs from the recorded exact targets"
                                 .to_owned(),
                         }
-                    } else if !relay_listeners_present(&record.session) {
+                    } else if !relay_listeners_present(&record) {
                         ProcessProxySessionStatus::RecoveryRequired {
                             detail: "the process-proxy relay listeners are unavailable".to_owned(),
                         }
@@ -314,12 +335,17 @@ pub async fn process_proxy_status(owner: &AuthenticatedOwner, active: &ActiveOwn
 }
 
 #[cfg(windows)]
-fn relay_listeners_present(session: &ProcessProxySession) -> bool {
-    relay_listener::verify(session.relay_pid, session.relay_port).is_ok()
+fn relay_listeners_present(record: &RecoveryRecord) -> bool {
+    relay_listener::verify_exact(
+        record.session.relay_pid,
+        record.session.relay_port,
+        Some(record.relay_created_at),
+    )
+    .is_ok()
 }
 
 #[cfg(not(windows))]
-fn relay_listeners_present(_session: &ProcessProxySession) -> bool {
+fn relay_listeners_present(_record: &RecoveryRecord) -> bool {
     false
 }
 
@@ -424,7 +450,7 @@ async fn monitor_session(owner_key: String, session_id: u64) {
         if matches!(targets_live, Ok(true))
             && policy_is_active().await
             && driver_session_matches(&record.session).await.unwrap_or(false)
-            && relay_listeners_present(&record.session)
+            && relay_listeners_present(&record)
         {
             continue;
         }
@@ -1122,6 +1148,7 @@ mod tests {
         cleanup.record_path = Some(service_paths()?.process_proxy_session_path());
         super::persist_record(&RecoveryRecord {
             phase: RecoveryPhase::Active,
+            relay_created_at: process_identity(std::process::id())?.unwrap().started_at,
             session: session.clone(),
         })
         .await?;
@@ -1177,6 +1204,7 @@ mod tests {
         cleanup.record_path = Some(service_paths()?.process_proxy_session_path());
         super::persist_record(&RecoveryRecord {
             phase: RecoveryPhase::Active,
+            relay_created_at: process_identity(std::process::id())?.unwrap().started_at,
             session: recovery_session,
         })
         .await?;
@@ -1517,10 +1545,12 @@ mod tests {
         let legacy = serde_json::to_value(&session).unwrap();
         let recovered: RecoveryRecord = serde_json::from_value(legacy).unwrap();
         assert_eq!(recovered.phase, RecoveryPhase::Active);
+        assert_eq!(recovered.relay_created_at, 0);
         assert_eq!(recovered.session, session);
 
         let pending = RecoveryRecord {
             phase: RecoveryPhase::Pending,
+            relay_created_at: 123,
             session,
         };
         let recovered: RecoveryRecord = serde_json::from_value(serde_json::to_value(pending).unwrap()).unwrap();

@@ -20,6 +20,29 @@ pub(super) fn verify(pid: u32, port: u16) -> Result<(), ServiceError> {
     Ok(())
 }
 
+pub(super) fn verify_exact(pid: u32, port: u16, expected_created_at: Option<u64>) -> Result<u64, ServiceError> {
+    let identity = || {
+        crate::core::process::process_identity(pid)
+            .map_err(|error| {
+                ServiceError::process_proxy_unavailable(format!("the relay identity cannot be read: {error:#}"))
+            })?
+            .ok_or_else(|| ServiceError::invalid_process_proxy_session("the relay process is no longer running"))
+    };
+    let before = identity()?;
+    if expected_created_at.is_some_and(|expected| expected != before.started_at) {
+        return Err(ServiceError::invalid_process_proxy_session(
+            "the relay process instance changed",
+        ));
+    }
+    verify(pid, port)?;
+    if identity()?.started_at != before.started_at {
+        return Err(ServiceError::invalid_process_proxy_session(
+            "the relay process instance changed while checking its listeners",
+        ));
+    }
+    Ok(before.started_at)
+}
+
 fn owned_loopback_listener(family: u32, pid: u32, port: u16) -> Result<bool, ServiceError> {
     let (table, used) = tcp_listener_table(family)?;
     let row_size = if family == u32::from(AF_INET) {
@@ -104,6 +127,9 @@ mod tests {
 
         let ipv6 = TcpListener::bind((Ipv6Addr::LOCALHOST, port)).unwrap();
         assert!(verify(pid, port).is_ok());
+        let created_at = verify_exact(pid, port, None).unwrap();
+        assert!(verify_exact(pid, port, Some(created_at)).is_ok());
+        assert!(verify_exact(pid, port, Some(created_at.wrapping_add(1))).is_err());
         assert!(verify(pid.wrapping_add(1), port).is_err());
         drop(ipv6);
         assert!(verify(pid, port).is_err());
