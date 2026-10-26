@@ -19,7 +19,7 @@ mod relay_listener;
 #[cfg(windows)]
 mod wfp;
 
-const DRIVER_PROTOCOL_VERSION: u32 = 3;
+const DRIVER_PROTOCOL_VERSION: u32 = 4;
 static RECOVERY_REQUIRED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -98,6 +98,13 @@ pub async fn attach_process_proxy(
     if let Err(error) = policy_install().await {
         return Err(rollback_failed_attach(session.session_id, error).await);
     }
+    if !driver_session_matches(&session).await.unwrap_or(false) {
+        return Err(rollback_failed_attach(
+            session.session_id,
+            ServiceError::process_proxy_recovery_required("the driver did not retain the attached exact targets"),
+        )
+        .await);
+    }
     if let Err(error) = persist_record(&RecoveryRecord {
         phase: RecoveryPhase::Active,
         session: session.clone(),
@@ -158,6 +165,13 @@ pub async fn update_process_proxy_targets(
     session.targets = request.targets.clone();
     if let Err(error) = driver_update(&session).await {
         return Err(rollback_failed_update(session.session_id, error).await);
+    }
+    if !driver_session_matches(&session).await.unwrap_or(false) {
+        return Err(rollback_failed_update(
+            session.session_id,
+            ServiceError::process_proxy_recovery_required("the driver did not retain the updated exact targets"),
+        )
+        .await);
     }
     if let Err(error) = persist_record(&RecoveryRecord {
         phase: RecoveryPhase::Active,
@@ -270,6 +284,11 @@ pub async fn process_proxy_status(owner: &AuthenticatedOwner, active: &ActiveOwn
                         ProcessProxySessionStatus::RecoveryRequired {
                             detail: "the WFP redirect filters are unavailable".to_owned(),
                         }
+                    } else if !driver_session_matches(&record.session).await.unwrap_or(false) {
+                        ProcessProxySessionStatus::RecoveryRequired {
+                            detail: "the driver session is unavailable or differs from the recorded exact targets"
+                                .to_owned(),
+                        }
                     } else if !relay_listeners_present(&record.session) {
                         ProcessProxySessionStatus::RecoveryRequired {
                             detail: "the process-proxy relay listeners are unavailable".to_owned(),
@@ -326,6 +345,59 @@ async fn active_target_present(_session: &ProcessProxySession) -> Result<bool> {
 }
 
 #[cfg(windows)]
+async fn driver_session_matches(session: &ProcessProxySession) -> std::result::Result<bool, ServiceError> {
+    let session = session.clone();
+    tokio::task::spawn_blocking(move || {
+        let snapshot = driver_query_blocking()?;
+        if snapshot.session_id != session.session_id
+            || snapshot.relay_pid != session.relay_pid
+            || snapshot.relay_port != session.relay_port
+        {
+            return Ok(false);
+        }
+        let recorded: std::collections::BTreeSet<_> = session
+            .targets
+            .iter()
+            .map(|target| (target.pid, target.created_at))
+            .collect();
+        let mut observed = std::collections::BTreeSet::new();
+        for target in snapshot.targets.iter().take(snapshot.target_count as usize) {
+            if target.pid == 0 && target.created_at == 0 {
+                continue;
+            }
+            let Ok(pid) = u32::try_from(target.pid) else {
+                return Ok(false);
+            };
+            if !recorded.contains(&(pid, target.created_at)) || !observed.insert((pid, target.created_at)) {
+                return Ok(false);
+            }
+        }
+        for target in &session.targets {
+            let live = crate::core::process::process_identity(target.pid)
+                .map_err(|error| {
+                    ServiceError::process_proxy_recovery_required(format!(
+                        "the selected process identity cannot be verified: {error:#}"
+                    ))
+                })?
+                .is_some_and(|identity| identity.started_at == target.created_at);
+            if live && !observed.contains(&(target.pid, target.created_at)) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })
+    .await
+    .map_err(|error| ServiceError::process_proxy_unavailable(format!("driver status worker failed: {error}")))?
+}
+
+#[cfg(not(windows))]
+async fn driver_session_matches(_session: &ProcessProxySession) -> std::result::Result<bool, ServiceError> {
+    Err(ServiceError::process_proxy_unavailable(
+        "process proxy is only available in the Windows service",
+    ))
+}
+
+#[cfg(windows)]
 async fn monitor_session(owner_key: String, session_id: u64) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     loop {
@@ -349,7 +421,11 @@ async fn monitor_session(owner_key: String, session_id: u64) {
             return;
         }
         let targets_live = active_target_present(&record.session).await;
-        if matches!(targets_live, Ok(true)) && policy_is_active().await && relay_listeners_present(&record.session) {
+        if matches!(targets_live, Ok(true))
+            && policy_is_active().await
+            && driver_session_matches(&record.session).await.unwrap_or(false)
+            && relay_listeners_present(&record.session)
+        {
             continue;
         }
         if let Err(error) = clear_recorded_session(session_id).await {
@@ -569,11 +645,25 @@ struct DriverUpdateRequest {
 }
 
 #[cfg(windows)]
+#[repr(C)]
+struct DriverQueryResponse {
+    version: u32,
+    size: u32,
+    session_id: u64,
+    relay_pid: u32,
+    relay_port: u16,
+    target_count: u16,
+    targets: [DriverTarget; PROCESS_PROXY_MAX_TARGETS],
+}
+
+#[cfg(windows)]
 const IOCTL_ATTACH_SESSION: u32 = 0x0012_a004;
 #[cfg(windows)]
 const IOCTL_DETACH_SESSION: u32 = 0x0012_a008;
 #[cfg(windows)]
 const IOCTL_UPDATE_TARGETS: u32 = 0x0012_a00c;
+#[cfg(windows)]
+const IOCTL_QUERY_SESSION: u32 = 0x0012_6010;
 
 #[cfg(windows)]
 fn driver_attach_blocking(session: &ProcessProxySession) -> std::result::Result<(), ServiceError> {
@@ -622,6 +712,81 @@ fn driver_detach_blocking(session_id: u64) -> std::result::Result<(), ServiceErr
         session_id,
     };
     send_driver_ioctl(IOCTL_DETACH_SESSION, &request)
+}
+
+#[cfg(windows)]
+fn driver_query_blocking() -> std::result::Result<DriverQueryResponse, ServiceError> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING},
+        System::IO::DeviceIoControl,
+    };
+
+    let path = r"\\.\Clash5ProcessProxy"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(ServiceError::process_proxy_unavailable(format!(
+            "the Clash5 WFP driver control device is unavailable: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut response = DriverQueryResponse {
+        version: 0,
+        size: 0,
+        session_id: 0,
+        relay_pid: 0,
+        relay_port: 0,
+        target_count: 0,
+        targets: [DriverTarget { pid: 0, created_at: 0 }; PROCESS_PROXY_MAX_TARGETS],
+    };
+    let mut returned = 0_u32;
+    let result = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_QUERY_SESSION,
+            std::ptr::null(),
+            0,
+            (&mut response as *mut DriverQueryResponse).cast(),
+            std::mem::size_of::<DriverQueryResponse>() as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    let error = std::io::Error::last_os_error();
+    unsafe {
+        CloseHandle(handle);
+    }
+    if result == 0 {
+        return Err(ServiceError::process_proxy_unavailable(format!(
+            "the Clash5 WFP driver session cannot be read: {error}"
+        )));
+    }
+    if returned as usize != std::mem::size_of::<DriverQueryResponse>()
+        || response.version != DRIVER_PROTOCOL_VERSION
+        || response.size as usize != std::mem::size_of::<DriverQueryResponse>()
+        || response.session_id == 0
+        || response.relay_pid == 0
+        || response.relay_port == 0
+        || response.target_count as usize > PROCESS_PROXY_MAX_TARGETS
+    {
+        return Err(ServiceError::process_proxy_recovery_required(
+            "the Clash5 WFP driver returned an invalid session snapshot",
+        ));
+    }
+    Ok(response)
 }
 
 #[cfg(windows)]
@@ -1174,6 +1339,13 @@ mod tests {
             ),
             "service did not attach the Chain test target"
         );
+        anyhow::ensure!(
+            matches!(
+                super::process_proxy_status(&owner, &active).await,
+                ProcessProxySessionStatus::Active { .. }
+            ),
+            "service did not verify the driver session before reporting active"
+        );
         let deadline = Instant::now() + Duration::from_secs(20);
         let exit = loop {
             if let Some(exit) = cleanup.child.try_wait()? {
@@ -1204,18 +1376,19 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn driver_attach_layout_matches_kernel_protocol() {
-        use super::{DriverAttachRequest, DriverTarget, DriverUpdateRequest};
+        use super::{DriverAttachRequest, DriverQueryResponse, DriverTarget, DriverUpdateRequest};
 
         assert_eq!(std::mem::size_of::<DriverTarget>(), 16);
         assert_eq!(std::mem::size_of::<DriverAttachRequest>(), 2072);
         assert_eq!(std::mem::size_of::<DriverUpdateRequest>(), 2072);
+        assert_eq!(std::mem::size_of::<DriverQueryResponse>(), 2072);
     }
 
     #[cfg(windows)]
     #[test]
     #[ignore = "requires an elevated Windows host with the clash5 WFP driver loaded"]
     fn driver_target_update_checks_exact_instances_and_session() -> anyhow::Result<()> {
-        use super::{driver_attach_blocking, driver_detach_blocking, driver_update_blocking};
+        use super::{driver_attach_blocking, driver_detach_blocking, driver_query_blocking, driver_update_blocking};
         use crate::core::process::process_identity;
         use std::process::{Child, Command, Stdio};
 
@@ -1278,9 +1451,23 @@ mod tests {
         };
         driver_attach_blocking(&session)?;
         cleanup.attached = true;
+        let attached = driver_query_blocking()?;
+        anyhow::ensure!(
+            attached.session_id == session.session_id,
+            "driver attached the wrong session"
+        );
+        anyhow::ensure!(
+            attached.targets[0].pid == u64::from(targets[0].pid),
+            "driver lost the initial target"
+        );
 
         session.targets = vec![targets[1].clone()];
         driver_update_blocking(&session)?;
+        let updated = driver_query_blocking()?;
+        anyhow::ensure!(
+            updated.targets[0].pid == u64::from(targets[1].pid),
+            "driver did not publish the new target"
+        );
         let mut wrong_session = session.clone();
         wrong_session.session_id += 1;
         anyhow::ensure!(
@@ -1293,9 +1480,17 @@ mod tests {
             driver_update_blocking(&stale_target).is_err(),
             "stale target update succeeded"
         );
-        driver_update_blocking(&session)?;
+        let unchanged = driver_query_blocking()?;
+        anyhow::ensure!(
+            unchanged.targets[0].pid == u64::from(targets[1].pid),
+            "a rejected update changed the target"
+        );
         driver_detach_blocking(session.session_id)?;
         cleanup.attached = false;
+        anyhow::ensure!(
+            driver_query_blocking().is_err(),
+            "detached driver still reported an active session"
+        );
         Ok(())
     }
 

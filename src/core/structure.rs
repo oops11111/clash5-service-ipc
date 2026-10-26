@@ -81,6 +81,11 @@ impl ProtocolInfo {
         self.protocol.epoch == ProtocolVersion::current().epoch
             && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_PROCESS_PROXY_UPDATE
     }
+
+    pub const fn supports_process_proxy_readback(&self) -> bool {
+        self.protocol.epoch == ProtocolVersion::current().epoch
+            && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_PROCESS_PROXY_READBACK
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -480,6 +485,9 @@ mod tests {
         older.protocol.revision = crate::MIN_SERVICE_REVISION_FOR_PROCESS_PROXY_UPDATE - 1;
         assert!(!older.supports_process_proxy_updates());
         assert!(ProtocolInfo::current().supports_process_proxy_updates());
+        older.protocol.revision = crate::MIN_SERVICE_REVISION_FOR_PROCESS_PROXY_READBACK - 1;
+        assert!(!older.supports_process_proxy_readback());
+        assert!(ProtocolInfo::current().supports_process_proxy_readback());
     }
 
     #[test]

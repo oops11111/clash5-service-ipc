@@ -84,7 +84,7 @@ pub static IPC_AUTH_EXPECT: &str =
 
 pub static VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROTOCOL_EPOCH: u16 = 2;
-pub const PROTOCOL_REVISION: u16 = 7;
+pub const PROTOCOL_REVISION: u16 = 8;
 pub const MIN_SUPPORTED_CLIENT_REVISION: u16 = 5;
 pub const MIN_REQUIRED_SERVICE_REVISION: u16 = 5;
 /// Revision that introduced `/clash/stage-runtime`.
@@ -95,3 +95,4 @@ pub const MIN_SERVICE_REVISION_FOR_RUNTIME_FILE_READ: u16 = 3;
 /// Capability revision for authenticated Windows process-proxy sessions.
 pub const MIN_SERVICE_REVISION_FOR_PROCESS_PROXY: u16 = 6;
 pub const MIN_SERVICE_REVISION_FOR_PROCESS_PROXY_UPDATE: u16 = 7;
+pub const MIN_SERVICE_REVISION_FOR_PROCESS_PROXY_READBACK: u16 = 8;
