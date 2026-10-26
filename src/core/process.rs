@@ -81,6 +81,63 @@ fn windows_process_identity_details_from_handle(handle: &OwnedHandle) -> Result<
     Ok(ProcessIdentity { executable, started_at })
 }
 
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ProcessTreeEntry {
+    pub(super) pid: u32,
+    pub(super) parent_pid: u32,
+    pub(super) started_at: u64,
+}
+
+#[cfg(windows)]
+pub(super) fn process_tree_snapshot() -> Result<Vec<ProcessTreeEntry>> {
+    use std::mem::size_of;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+        },
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let result = (|| {
+        let mut entry = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut entries = Vec::new();
+        let mut first = true;
+        loop {
+            let available = unsafe {
+                if first {
+                    first = false;
+                    Process32FirstW(snapshot, &mut entry)
+                } else {
+                    Process32NextW(snapshot, &mut entry)
+                }
+            };
+            if available == 0 {
+                break;
+            }
+            if let Some(identity) = process_identity(entry.th32ProcessID)? {
+                entries.push(ProcessTreeEntry {
+                    pid: entry.th32ProcessID,
+                    parent_pid: entry.th32ParentProcessID,
+                    started_at: identity.started_at,
+                });
+            }
+        }
+        Ok(entries)
+    })();
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    result
+}
+
 pub(super) fn process_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
     #[cfg(unix)]
     if checked_unix_pid(pid).is_none() {

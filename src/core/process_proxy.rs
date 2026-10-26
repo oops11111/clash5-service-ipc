@@ -365,6 +365,91 @@ async fn active_target_present(session: &ProcessProxySession) -> Result<bool> {
     .await?
 }
 
+#[cfg(windows)]
+fn expand_process_tree(session: &ProcessProxySession) -> Result<Vec<ProcessProxyTarget>> {
+    let entries = crate::core::process::process_tree_snapshot()?;
+    expand_tree_entries(&entries, &session.targets, session.relay_pid)
+}
+
+#[cfg(windows)]
+fn expand_tree_entries(
+    entries: &[crate::core::process::ProcessTreeEntry],
+    targets: &[ProcessProxyTarget],
+    relay_pid: u32,
+) -> Result<Vec<ProcessProxyTarget>> {
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+    let by_parent = entries.iter().fold(BTreeMap::<u32, Vec<_>>::new(), |mut map, entry| {
+        map.entry(entry.parent_pid).or_default().push(entry);
+        map
+    });
+    let live = entries
+        .iter()
+        .map(|entry| (entry.pid, entry.started_at))
+        .collect::<BTreeSet<_>>();
+    let mut known: BTreeSet<_> = targets
+        .iter()
+        .map(|target| (target.pid, target.created_at))
+        .filter(|target| live.contains(target))
+        .collect();
+    let mut active_parents: VecDeque<_> = known.iter().copied().collect();
+    while let Some((parent_pid, parent_created_at)) = active_parents.pop_front() {
+        for child in by_parent.get(&parent_pid).into_iter().flatten() {
+            if child.started_at < parent_created_at || child.pid == relay_pid {
+                continue;
+            }
+            let child_key = (child.pid, child.started_at);
+            if known.insert(child_key) {
+                active_parents.push_back(child_key);
+            }
+        }
+    }
+    if known.len() > PROCESS_PROXY_MAX_TARGETS {
+        anyhow::bail!("the selected process tree exceeds the {PROCESS_PROXY_MAX_TARGETS}-target limit");
+    }
+    Ok(known
+        .into_iter()
+        .map(|(pid, created_at)| ProcessProxyTarget { pid, created_at })
+        .collect())
+}
+
+#[cfg(windows)]
+async fn refresh_process_tree(record: &RecoveryRecord) -> std::result::Result<Option<RecoveryRecord>, ServiceError> {
+    let session = record.session.clone();
+    let targets = tokio::task::spawn_blocking(move || expand_process_tree(&session))
+        .await
+        .map_err(|error| ServiceError::process_proxy_unavailable(format!("process-tree worker failed: {error}")))?
+        .map_err(|error| {
+            ServiceError::process_proxy_recovery_required(format!(
+                "process-tree identity could not be verified: {error:#}"
+            ))
+        })?;
+    if targets.len() == record.session.targets.len()
+        && targets.iter().all(|target| record.session.targets.contains(target))
+    {
+        return Ok(None);
+    }
+    let mut refreshed = record.session.clone();
+    refreshed.targets = targets;
+    driver_update(&refreshed).await?;
+    if !driver_session_matches(&refreshed).await.unwrap_or(false) {
+        return Err(ServiceError::process_proxy_recovery_required(
+            "the driver did not retain the refreshed process tree",
+        ));
+    }
+    let refreshed_record = RecoveryRecord {
+        phase: RecoveryPhase::Active,
+        relay_created_at: record.relay_created_at,
+        session: refreshed,
+    };
+    persist_record(&refreshed_record).await.map_err(|error| {
+        ServiceError::process_proxy_recovery_required(format!(
+            "the refreshed process tree could not be persisted: {error:#}"
+        ))
+    })?;
+    Ok(Some(refreshed_record))
+}
+
 #[cfg(not(windows))]
 async fn active_target_present(_session: &ProcessProxySession) -> Result<bool> {
     Ok(true)
@@ -446,6 +531,20 @@ async fn monitor_session(owner_key: String, session_id: u64) {
             tracing::error!("process-proxy monitor found a non-active recovery record");
             return;
         }
+        let record = match refresh_process_tree(&record).await {
+            Ok(Some(record)) => record,
+            Ok(None) => record,
+            Err(error) => {
+                tracing::error!("process-proxy monitor could not refresh the selected process tree: {error}");
+                if let Err(cleanup_error) = clear_recorded_session(session_id).await {
+                    RECOVERY_REQUIRED.store(true, Ordering::Release);
+                    tracing::error!(
+                        "process-proxy monitor could not detach after tree refresh failure: {cleanup_error:#}"
+                    );
+                }
+                return;
+            }
+        };
         let targets_live = active_target_present(&record.session).await;
         if matches!(targets_live, Ok(true))
             && policy_is_active().await
@@ -1573,5 +1672,65 @@ mod tests {
         let mut duplicate = request();
         duplicate.targets.push(duplicate.targets[0].clone());
         assert!(validate_request(&duplicate).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_tree_expansion_accepts_only_live_descendants_and_rejects_stale_lineage() {
+        use super::expand_tree_entries;
+        use crate::core::process::ProcessTreeEntry;
+
+        let entries = [
+            ProcessTreeEntry {
+                pid: 10,
+                parent_pid: 1,
+                started_at: 100,
+            },
+            ProcessTreeEntry {
+                pid: 11,
+                parent_pid: 10,
+                started_at: 110,
+            },
+            ProcessTreeEntry {
+                pid: 12,
+                parent_pid: 11,
+                started_at: 120,
+            },
+            ProcessTreeEntry {
+                pid: 13,
+                parent_pid: 10,
+                started_at: 90,
+            },
+            ProcessTreeEntry {
+                pid: 14,
+                parent_pid: 999,
+                started_at: 140,
+            },
+        ];
+        let targets = [
+            ProcessProxyTarget {
+                pid: 10,
+                created_at: 100,
+            },
+            ProcessProxyTarget { pid: 99, created_at: 9 },
+        ];
+        let expanded = expand_tree_entries(&entries, &targets, 15).expect("tree expands");
+        assert_eq!(
+            expanded,
+            vec![
+                ProcessProxyTarget {
+                    pid: 10,
+                    created_at: 100,
+                },
+                ProcessProxyTarget {
+                    pid: 11,
+                    created_at: 110,
+                },
+                ProcessProxyTarget {
+                    pid: 12,
+                    created_at: 120,
+                },
+            ]
+        );
     }
 }
