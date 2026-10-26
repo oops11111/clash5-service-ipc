@@ -61,6 +61,18 @@ impl ServiceError {
     pub(crate) fn proxy_apply_failed(message: impl Into<String>) -> Self {
         Self::new(ServiceErrorCode::ProxyApplyFailed, message)
     }
+
+    pub(crate) fn process_proxy_unavailable(message: impl Into<String>) -> Self {
+        Self::new(ServiceErrorCode::ProcessProxyUnavailable, message)
+    }
+
+    pub(crate) fn invalid_process_proxy_session(message: impl Into<String>) -> Self {
+        Self::new(ServiceErrorCode::InvalidProcessProxySession, message)
+    }
+
+    pub(crate) fn process_proxy_recovery_required(message: impl Into<String>) -> Self {
+        Self::new(ServiceErrorCode::ProcessProxyRecoveryRequired, message)
+    }
 }
 
 impl fmt::Display for ServiceError {
