@@ -198,8 +198,8 @@ struct WatchdogConfig {
 impl Default for WatchdogConfig {
     fn default() -> Self {
         Self {
-            max_restarts: 10,
-            restart_window: Duration::from_secs(600),
+            max_restarts: 3,
+            restart_window: Duration::from_secs(300),
             max_backoff: Duration::from_secs(30),
         }
     }
@@ -233,6 +233,19 @@ fn watchdog_config() -> WatchdogConfig {
     }
 
     WatchdogConfig::default()
+}
+
+#[cfg(test)]
+mod watchdog_policy_tests {
+    use super::WatchdogConfig;
+    use std::time::Duration;
+
+    #[test]
+    fn default_watchdog_budget_is_three_restarts_per_five_minutes() {
+        let config = WatchdogConfig::default();
+        assert_eq!(config.max_restarts, 3);
+        assert_eq!(config.restart_window, Duration::from_secs(5 * 60));
+    }
 }
 
 fn backoff_delay(attempt: u32, max: Duration) -> Duration {
