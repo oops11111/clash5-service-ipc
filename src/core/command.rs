@@ -27,6 +27,8 @@ pub enum IpcCommand {
     SetSystemProxy,
     #[strum(serialize = "/writer")]
     UpdateWriter,
+    #[strum(serialize = "/process-proxy/session")]
+    ProcessProxySession,
     #[strum(serialize = "/magic")]
     Magic,
 }

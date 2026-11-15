@@ -21,6 +21,10 @@ pub async fn reconcile_service_startup() -> Result<()> {
     STARTUP_RECONCILED.store(false, Ordering::Release);
     info!("Running service startup reconciliation");
 
+    // A WFP session can outlive the client process. Recover it before accepting normal
+    // requests so a stale redirect cannot coexist with a newly selected process tree.
+    crate::core::process_proxy::reconcile_process_proxy_session().await?;
+
     let Some(record) = read_core_runtime_record().await? else {
         STARTUP_RECONCILED.store(true, Ordering::Release);
         return Ok(());
