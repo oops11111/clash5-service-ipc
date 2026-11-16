@@ -24,11 +24,30 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn bundled_service_binary() -> Result<PathBuf, Error> {
-    let source = std::env::current_exe()?.with_file_name(if cfg!(windows) {
-        "clash5-service.exe"
+    let directory = std::env::current_exe()?.parent().map(std::path::Path::to_path_buf);
+    // Packaging ships the service as clash5-service.exe. Older bundles and the
+    // release artifacts still carry the pre-rename name, so accept either.
+    let candidates: &[&str] = if cfg!(windows) {
+        &["clash5-service.exe", "clash-verge-service.exe"]
     } else {
-        "clash-verge-service"
-    });
+        &["clash5-service", "clash-verge-service"]
+    };
+    let mut source = None;
+    if let Some(directory) = directory.as_deref() {
+        for name in candidates {
+            let candidate = directory.join(name);
+            if std::fs::symlink_metadata(&candidate).is_ok_and(|metadata| metadata.file_type().is_file()) {
+                source = Some(candidate);
+                break;
+            }
+        }
+    }
+    let source = source.with_context(|| {
+        format!(
+            "failed to locate a bundled service binary next to {:?}",
+            std::env::current_exe()
+        )
+    })?;
     let metadata = std::fs::symlink_metadata(&source)
         .with_context(|| format!("failed to inspect bundled service binary {source:?}"))?;
     if !metadata.file_type().is_file() {

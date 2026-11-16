@@ -247,7 +247,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $state = sc query clash_verge_service | Select-String "STATE"
+          $state = sc query clash5_service | Select-String "STATE"
           if ($state -notmatch "RUNNING") { exit 1 }
 
       - name: Start mock_binary (Windows)
@@ -286,7 +286,7 @@ jobs:
         if: ${{ always() && runner.os == 'Windows' }}
         shell: pwsh
         run: |
-          $service = Get-Service -Name "clash_verge_service" -ErrorAction SilentlyContinue
+          $service = Get-Service -Name "clash5_service" -ErrorAction SilentlyContinue
           if ($null -ne $service) {
             $uninstaller = "$env:GITHUB_WORKSPACE\\target\\release\\clash-verge-service-uninstall.exe"
             if (-not (Test-Path -LiteralPath $uninstaller)) {

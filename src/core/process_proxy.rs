@@ -972,7 +972,10 @@ fn send_driver_ioctl<T>(code: u32, request: &T) -> std::result::Result<(), Servi
 #[cfg(test)]
 mod tests {
     use super::{RecoveryPhase, RecoveryRecord, validate_request};
-    use crate::{ProcessProxyAttachRequest, ProcessProxySession, ProcessProxySessionStatus, ProcessProxyTarget};
+    use crate::{ProcessProxyAttachRequest, ProcessProxySession, ProcessProxyTarget};
+    // Only the elevated Windows tests read the session status back.
+    #[cfg(windows)]
+    use crate::ProcessProxySessionStatus;
 
     #[cfg(windows)]
     #[test]
