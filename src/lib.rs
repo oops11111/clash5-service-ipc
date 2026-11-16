@@ -9,8 +9,8 @@ pub mod management;
 mod client;
 
 pub use channel::{
-    CHANNEL_IDENTITY, ChannelIdentity, MACOS_APP_BUNDLE_ID, MACOS_SERVICE_ID, SERVICE_DISPLAY_NAME, SERVICE_SLUG,
-    WINDOWS_SERVICE_NAME,
+    CHANNEL_IDENTITY, ChannelIdentity, LEGACY_WINDOWS_SERVICE_NAME, MACOS_APP_BUNDLE_ID, MACOS_SERVICE_ID,
+    SERVICE_DISPLAY_NAME, SERVICE_SLUG, WINDOWS_SERVICE_NAME,
 };
 pub use core::{
     AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, CoreAvailability, CoreConfig, CoreInspection,
