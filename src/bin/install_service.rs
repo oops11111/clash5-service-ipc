@@ -24,11 +24,30 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn bundled_service_binary() -> Result<PathBuf, Error> {
-    let source = std::env::current_exe()?.with_file_name(if cfg!(windows) {
-        "clash-verge-service.exe"
+    let directory = std::env::current_exe()?.parent().map(std::path::Path::to_path_buf);
+    // Packaging ships the service as clash5-service.exe. Older bundles and the
+    // release artifacts still carry the pre-rename name, so accept either.
+    let candidates: &[&str] = if cfg!(windows) {
+        &["clash5-service.exe", "clash-verge-service.exe"]
     } else {
-        "clash-verge-service"
-    });
+        &["clash5-service", "clash-verge-service"]
+    };
+    let mut source = None;
+    if let Some(directory) = directory.as_deref() {
+        for name in candidates {
+            let candidate = directory.join(name);
+            if std::fs::symlink_metadata(&candidate).is_ok_and(|metadata| metadata.file_type().is_file()) {
+                source = Some(candidate);
+                break;
+            }
+        }
+    }
+    let source = source.with_context(|| {
+        format!(
+            "failed to locate a bundled service binary next to {:?}",
+            std::env::current_exe()
+        )
+    })?;
     let metadata = std::fs::symlink_metadata(&source)
         .with_context(|| format!("failed to inspect bundled service binary {source:?}"))?;
     if !metadata.file_type().is_file() {
@@ -908,11 +927,12 @@ fn main() -> anyhow::Result<()> {
     }
     let source = bundled_service_binary()?;
     let install_dir = clash_verge_service_ipc::prepare_service_install_directory()?;
-    let target = install_dir.join("clash-verge-service.exe");
+    let target = install_dir.join("clash5-service.exe");
     let staged = stage_binary(&source, &target)?;
 
     let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
+    remove_legacy_service(&service_manager, &install_dir, options.debug)?;
     let start_type = if cfg!(feature = "development-channel") {
         ServiceStartType::OnDemand
     } else {
@@ -1002,11 +1022,80 @@ fn main() -> anyhow::Result<()> {
     let start_access = ServiceAccess::CHANGE_CONFIG | ServiceAccess::START;
     let service = service_manager.create_service(&service_info, start_access)?;
 
-    service.set_description("Clash Verge Service helps to launch Clash Core")?;
+    service.set_description("clash5 Service helps to launch Clash Core")?;
     configure_windows_service_recovery(&service)?;
     service.start(&Vec::<&OsStr>::new())?;
     wait_for_service_ready()?;
 
+    Ok(())
+}
+
+/// Removes a clash5 service registered under the pre-rename service name.
+///
+/// The old name (`clash_verge_service`) is also used by the upstream Clash
+/// Verge product, so the service is only removed when its configured binary is
+/// our previous install path. Anything else is left running.
+#[cfg(windows)]
+fn remove_legacy_service(
+    service_manager: &platform_lib::service_manager::ServiceManager,
+    install_dir: &std::path::Path,
+    debug: bool,
+) -> anyhow::Result<()> {
+    use platform_lib::service::{ServiceAccess, ServiceState};
+    use std::{thread, time::Duration};
+
+    const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+    const ERROR_SERVICE_NOT_ACTIVE: i32 = 1062;
+
+    let legacy_name = clash_verge_service_ipc::LEGACY_WINDOWS_SERVICE_NAME;
+    let access =
+        ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG | ServiceAccess::STOP | ServiceAccess::DELETE;
+    let service = match service_manager.open_service(legacy_name, access) {
+        Ok(service) => service,
+        Err(platform_lib::Error::Winapi(error)) if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) => {
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let legacy_binary = install_dir.join("clash-verge-service.exe");
+    let configured = service.query_config()?.executable_path;
+    let configured = std::path::PathBuf::from(configured.to_string_lossy().trim_matches('"'));
+    if configured != legacy_binary {
+        if debug {
+            println!(
+                "leaving {legacy_name} alone: it runs {} rather than our previous install",
+                configured.display()
+            );
+        }
+        return Ok(());
+    }
+
+    if service.query_status()?.current_state != ServiceState::Stopped {
+        if let Err(error) = service.stop()
+            && !matches!(
+                &error,
+                platform_lib::Error::Winapi(error)
+                    if error.raw_os_error() == Some(ERROR_SERVICE_NOT_ACTIVE)
+            )
+        {
+            return Err(error.into());
+        }
+        for _ in 0..200 {
+            if service.query_status()?.current_state == ServiceState::Stopped {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        if service.query_status()?.current_state != ServiceState::Stopped {
+            anyhow::bail!("timed out waiting for the previous {legacy_name} service to stop");
+        }
+    }
+
+    service.delete()?;
+    if debug {
+        println!("removed the previous {legacy_name} service registered from our install");
+    }
     Ok(())
 }
 

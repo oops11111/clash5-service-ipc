@@ -173,7 +173,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $serviceName = "clash_verge_service"
+          $serviceName = "clash5_service"
           $driver = "$env:GITHUB_WORKSPACE\target\release\service-integration-driver.exe"
 
           function Show-Diagnostics {
@@ -232,7 +232,7 @@ jobs:
         if: always() && runner.os == 'Windows'
         shell: pwsh
         run: |
-          $service = Get-Service -Name "clash_verge_service" -ErrorAction SilentlyContinue
+          $service = Get-Service -Name "clash5_service" -ErrorAction SilentlyContinue
           if ($null -ne $service) {
             & "$env:GITHUB_WORKSPACE\target\release\clash-verge-service-uninstall.exe"
           }

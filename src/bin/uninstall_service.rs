@@ -255,13 +255,45 @@ fn main() -> anyhow::Result<()> {
         Err(error) if has_raw_error(&error, ERROR_SERVICE_DOES_NOT_EXIST) => {}
         Err(error) => return Err(error.into()),
     }
-    let target = clash_verge_service_ipc::prepare_service_install_directory()?.join("clash-verge-service.exe");
+    let install_dir = clash_verge_service_ipc::prepare_service_install_directory()?;
+    let target = install_dir.join("clash5-service.exe");
     if target.exists() {
         std::fs::remove_file(&target)
             .map_err(|error| anyhow::anyhow!("Failed to remove service binary {target:?}: {error}"))?;
     }
     // A fallback publish may have displaced a locked service image aside; best-effort.
     let _ = std::fs::remove_file(target.with_extension(clash_verge_service_ipc::CORE_DISPLACED_EXTENSION));
+
+    // Clean up an installation made before the service rename. The old name is
+    // shared with the upstream Clash Verge product, so the registration is only
+    // removed when it points at our previous binary.
+    let legacy_binary = install_dir.join("clash-verge-service.exe");
+    let legacy_access =
+        ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG | ServiceAccess::STOP | ServiceAccess::DELETE;
+    if let Ok(legacy) =
+        service_manager.open_service(clash_verge_service_ipc::LEGACY_WINDOWS_SERVICE_NAME, legacy_access)
+    {
+        let configured = legacy.query_config()?.executable_path;
+        let configured = std::path::PathBuf::from(configured.to_string_lossy().trim_matches('"'));
+        if configured == legacy_binary {
+            if legacy.query_status()?.current_state != ServiceState::Stopped {
+                let _ = legacy.stop();
+                let _ = poll_until(
+                    POLL_ATTEMPTS,
+                    || {
+                        let status = legacy.query_status()?;
+                        Ok((status.current_state == ServiceState::Stopped).then_some(()))
+                    },
+                    || thread::sleep(POLL_INTERVAL),
+                    "timed out waiting for the previous service to stop",
+                );
+            }
+            let _ = legacy.delete();
+        }
+    }
+    if legacy_binary.exists() {
+        let _ = std::fs::remove_file(&legacy_binary);
+    }
     shared::repair_active_owner_state()?;
     remove_installed_cores();
     println!("Service uninstalled successfully. Resource cleanup warnings can be ignored.");

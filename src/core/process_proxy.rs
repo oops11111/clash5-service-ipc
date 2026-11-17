@@ -19,6 +19,10 @@ mod relay_listener;
 #[cfg(windows)]
 mod wfp;
 
+// Only the WFP driver paths (all #[cfg(windows)]) speak this protocol version,
+// so on unix builds the constant would otherwise be dead code and `-D warnings`
+// would fail the clippy job.
+#[cfg(windows)]
 const DRIVER_PROTOCOL_VERSION: u32 = 4;
 static RECOVERY_REQUIRED: AtomicBool = AtomicBool::new(false);
 
@@ -972,7 +976,10 @@ fn send_driver_ioctl<T>(code: u32, request: &T) -> std::result::Result<(), Servi
 #[cfg(test)]
 mod tests {
     use super::{RecoveryPhase, RecoveryRecord, validate_request};
-    use crate::{ProcessProxyAttachRequest, ProcessProxySession, ProcessProxySessionStatus, ProcessProxyTarget};
+    use crate::{ProcessProxyAttachRequest, ProcessProxySession, ProcessProxyTarget};
+    // Only the elevated Windows tests read the session status back.
+    #[cfg(windows)]
+    use crate::ProcessProxySessionStatus;
 
     #[cfg(windows)]
     #[test]
