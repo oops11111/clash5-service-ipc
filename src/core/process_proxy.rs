@@ -19,6 +19,10 @@ mod relay_listener;
 #[cfg(windows)]
 mod wfp;
 
+// Only the WFP driver paths (all #[cfg(windows)]) speak this protocol version,
+// so on unix builds the constant would otherwise be dead code and `-D warnings`
+// would fail the clippy job.
+#[cfg(windows)]
 const DRIVER_PROTOCOL_VERSION: u32 = 4;
 static RECOVERY_REQUIRED: AtomicBool = AtomicBool::new(false);
 
